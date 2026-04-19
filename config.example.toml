@@ -1,0 +1,74 @@
+# dmt-indexer configuration.
+#
+# Copy to config.toml and edit for your deployment.
+
+[bitcoin]
+rpc_url = "http://127.0.0.1:8332"
+# Use either cookie_file OR rpc_user + rpc_password.
+cookie_file = "/var/lib/bitcoind/.cookie"
+# rpc_user     = "bitcoin"
+# rpc_password = "change-me"
+# Per-request timeout for RPC calls, in seconds.
+timeout_secs = 60
+
+[storage]
+db_path = "/var/lib/dmt-indexer/index.redb"
+
+[sync]
+# NAT deploy block. Earlier heights have no DMT activity we care about,
+# so start_height governs the cold-start floor. For existing DBs this
+# value is ignored in favor of the persisted cursor.
+start_height        = 817709
+# Blocks behind tip to keep indexed. 0 = index up to the tip. Any reorg
+# triggers a rewind + replay on the next tick.
+finality_depth      = 0
+# Upper bound on blocks applied per tick.
+max_blocks_per_tick = 500
+# Blocks per redb write transaction. Larger = cheaper fsyncs, more work
+# lost on a crash mid-batch (recovered by replay from the last commit).
+commit_interval     = 200
+# Concurrent block prefetch + rayon parse. Scale with cores.
+parallelism         = 8
+# Sleep between polls when caught up, in milliseconds.
+poll_idle_ms        = 2000
+
+[api]
+bind_addr = "127.0.0.1:8080"
+# Expose /admin/* endpoints. Keep false in production unless firewalled.
+enable_admin = false
+# Shared secret required in `X-Admin-Token` header for /admin/* calls.
+# When admin is enabled but this is empty, admin calls are OPEN and
+# the indexer logs a startup warning. Set a non-empty value in prod.
+# admin_token = "change-me"
+# Max rows returned from a single /activity or /holders page.
+max_page_size = 200
+
+[api.cors]
+# Comma-separated list of origins allowed to hit the read API.
+# Use "*" to allow all. Leave empty to disable CORS entirely.
+allowed_origins = []
+
+[api.cache]
+# In-process response cache for hot GET endpoints
+# (/status, /holders, /activity, /wallets/*). Short-TTL;
+# safe because it's shorter than block time.
+enabled  = true
+ttl_ms   = 2000
+capacity = 1024
+
+[api.rate_limit]
+# Per-IP token-bucket limiter. Off by default; switch on if you
+# expose the API to the public internet. Client IP is read from
+# x-forwarded-for / x-real-ip (first hop) or the socket peer.
+#
+# Defaults are intentionally generous — aimed at blocking scrapers
+# and abuse, not real users. A human can't exceed ~5 req/s; a normal
+# page load fires <10. Multiple users behind a shared NAT still fit.
+# Tighten only if you have a specific reason to.
+enabled    = false
+per_second = 100
+burst      = 200
+
+# Optional conformance settings. Only used by `dmt-indexer verify`.
+# [conformance]
+# postgres_url = "postgres://nat_ro@127.0.0.1:5432/nat"

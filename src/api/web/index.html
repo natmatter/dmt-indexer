@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>NAT</title>
+<meta name="description" content="NAT — a non-arbitrary token on Bitcoin. Look up any wallet." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='3.6' fill='%23FFD400'/><circle cx='16' cy='5' r='1.8' fill='%2300A651'/><circle cx='25' cy='21' r='1.8' fill='%231F4BFF'/><circle cx='7' cy='21' r='1.8' fill='%23E50012'/><circle cx='7' cy='11' r='1.8' fill='%23F2F2F2'/></svg>" />
+<style>
+  :root {
+    --bg:        #0B0B0C;
+    --bg-2:      #121214;
+    --paper:     #F5F5F0;
+    --dim:       #8A8A82;
+    --dim-2:     #58584F;
+    --rule:      #24241f;
+    --rule-2:    #34342e;
+    --accent:    #FFD400;
+    --credit:    #5BE39A;
+    --debit:     #FF6B6B;
+    --font:      "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  html { background: var(--bg); }
+  body {
+    font-family: var(--font);
+    color: var(--paper);
+    background: var(--bg);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    font-variant-ligatures: none;
+    font-feature-settings: "ss02";
+  }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: var(--accent); color: #111; }
+
+  /* Layout */
+  .wrap {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 28px 32px 80px;
+  }
+
+  /* Header */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 12px;
+    font-size: 14px; font-weight: 500; letter-spacing: 0.08em;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color .15s;
+  }
+  .brand:hover b { color: var(--accent); }
+  .brand svg { width: 22px; height: 22px; display: block; }
+  .brand b { color: var(--paper); }
+  .brand span { color: var(--dim); }
+  .tip {
+    font-size: 12px; color: var(--dim);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .tip b { color: var(--paper); font-weight: 500; }
+  .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--credit);
+    box-shadow: 0 0 0 0 rgba(91,227,154,0.55);
+    animation: pulse 2.2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(91,227,154,0.55); }
+    70% { box-shadow: 0 0 0 8px rgba(91,227,154,0); }
+    100% { box-shadow: 0 0 0 0 rgba(91,227,154,0); }
+  }
+
+  /* Hero */
+  .hero {
+    padding: 64px 0 32px;
+  }
+  .hero h1 {
+    margin: 0 0 6px;
+    font-family: var(--font);
+    font-weight: 300;
+    font-size: clamp(36px, 6vw, 60px);
+    line-height: 1.02;
+    letter-spacing: -0.02em;
+    color: var(--paper);
+  }
+  .hero h1 em {
+    font-style: normal;
+    color: var(--accent);
+  }
+  .hero .sub {
+    color: var(--dim);
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Search */
+  .search {
+    margin-top: 40px;
+    position: relative;
+  }
+  .search label {
+    display: block;
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--dim); margin-bottom: 10px;
+  }
+  .search-row {
+    display: flex; gap: 0; align-items: stretch;
+    border: 1px solid var(--rule-2);
+    background: var(--bg-2);
+    transition: border-color .2s;
+  }
+  .search-row:focus-within { border-color: var(--accent); }
+  .search input {
+    flex: 1;
+    background: transparent; border: 0; outline: none;
+    color: var(--paper);
+    font: inherit; font-size: 15px;
+    padding: 16px 18px;
+    letter-spacing: 0.01em;
+  }
+  .search input::placeholder { color: var(--dim-2); }
+  .search button {
+    background: transparent; border: 0; border-left: 1px solid var(--rule-2);
+    color: var(--paper);
+    font: inherit; font-size: 12px;
+    padding: 0 22px; letter-spacing: 0.12em; text-transform: uppercase;
+    cursor: pointer; transition: background .15s, color .15s;
+  }
+  .search button:hover { background: var(--accent); color: #111; }
+  .search .hint {
+    margin-top: 10px; font-size: 11px; color: var(--dim);
+    min-height: 1em;
+  }
+  .search .hint.err { color: var(--debit); }
+
+  /* Sections */
+  section {
+    margin-top: 56px;
+  }
+  .sec-title {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 20px;
+  }
+  .sec-title h2 {
+    margin: 0; font-size: 13px; font-weight: 500;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--paper);
+    white-space: nowrap;
+  }
+  .sec-title .meta { font-size: 11px; color: var(--dim); letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
+
+  /* Wallet card */
+  .wallet {
+    display: none;
+  }
+  .wallet.active { display: block; }
+
+  .wallet .addr-row {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 28px; flex-wrap: wrap;
+  }
+  .wallet .addr {
+    font-size: 12px; color: var(--paper);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    flex: 1; min-width: 0;
+  }
+  .wallet .copy {
+    font-size: 10px; color: var(--dim); letter-spacing: 0.14em; text-transform: uppercase;
+    border: 1px solid var(--rule-2); padding: 4px 8px; cursor: pointer;
+    background: transparent; font-family: inherit; transition: all .15s;
+  }
+  .wallet .copy:hover { color: var(--paper); border-color: var(--paper); }
+
+  .balances {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+    border: 1px solid var(--rule);
+    margin-bottom: 32px;
+  }
+  .balances .cell {
+    padding: 22px 20px;
+    border-right: 1px solid var(--rule);
+  }
+  .balances .cell:last-child { border-right: 0; }
+  .balances .lbl {
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim);
+    margin-bottom: 10px;
+  }
+  .balances .val {
+    font-size: clamp(22px, 2.6vw, 30px); font-weight: 300;
+    color: var(--paper);
+    letter-spacing: -0.01em;
+    line-height: 1;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .balances .cell.primary .val { color: var(--accent); }
+  .balances .cell .val-exact {
+    margin-top: 8px;
+    font-size: 11px; color: var(--dim);
+    white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+  }
+  .balances .cell .lbl { white-space: nowrap; }
+  .balances .cell { min-width: 0; }
+  .balances .cell .unit { font-size: 11px; color: var(--dim); margin-top: 8px; letter-spacing: 0.12em; text-transform: uppercase; }
+
+  /* Activity list — 6-column grid with column headers. Columns:
+     block | type | from | to | amount | time */
+  .list { list-style: none; margin: 0; padding: 0; }
+  .list-head, .list li {
+    display: grid;
+    /* Fixed amount column so from/to widths match across header & data rows. */
+    grid-template-columns: 90px 100px minmax(0, 1fr) minmax(0, 1fr) 180px 60px;
+    gap: 16px; align-items: center;
+  }
+  .list-head {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 2px;
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim);
+  }
+  .list-head span { white-space: nowrap; }
+  .list-head .amt-h, .list-head .t-h { text-align: right; }
+  .list li {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 13px;
+  }
+  .list .amt { text-align: right; }
+  .list li:last-child { border-bottom: 0; }
+  .list .blk { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .list .tag {
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    padding: 4px 8px; border: 1px solid var(--rule-2); color: var(--dim);
+    text-align: center; display: inline-block;
+    white-space: nowrap; overflow: hidden; text-overflow: clip;
+    min-width: 0;
+  }
+  .list .tag.in   { color: var(--credit); border-color: rgba(91,227,154,0.35); }
+  .list .tag.out  { color: var(--debit);  border-color: rgba(255,107,107,0.35); }
+  .list .tag.mint { color: var(--accent); border-color: rgba(255,212,0,0.45); }
+  .list .tag.burn { color: var(--debit);  border-color: rgba(255,107,107,0.35); }
+  .list .tag.info { color: var(--dim);    border-color: var(--rule-2); }
+  .list .from, .list .to {
+    color: var(--paper);
+    min-width: 0;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* Extra breathing room between Type and From. */
+  .list .from, .list-head > :nth-child(3) { padding-left: 16px; }
+  .list .from a, .list .to a {
+    border-bottom: 1px dotted transparent;
+    transition: border-color .15s, color .15s;
+  }
+  .list .from a:hover, .list .to a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+  .list .none { color: var(--dim-2); }
+  .list .self-you { color: var(--accent); }
+  .list .amt { font-variant-numeric: tabular-nums; }
+  .list .amt.in  { color: var(--credit); }
+  .list .amt.out { color: var(--debit); }
+  .list .t {
+    color: var(--dim); font-size: 12px; text-align: right;
+    white-space: nowrap;
+  }
+  .list .t a {
+    color: inherit; border-bottom: 1px dotted transparent;
+    transition: color .15s, border-color .15s;
+  }
+  .list .t a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Pager */
+  .pager {
+    margin-top: 22px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap;
+    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  .pager .group { display: flex; gap: 0; border: 1px solid var(--rule-2); }
+  .pager .group button {
+    background: transparent; border: 0; border-right: 1px solid var(--rule-2);
+    color: var(--paper); font: inherit; font-size: 11px;
+    padding: 8px 14px; letter-spacing: 0.14em; text-transform: uppercase;
+    cursor: pointer; transition: background .15s, color .15s;
+    white-space: nowrap;
+  }
+  .pager .group button:last-child { border-right: 0; }
+  .pager .group button:hover:not(:disabled) { background: var(--accent); color: #111; }
+  .pager .group button:disabled { color: var(--dim-2); cursor: default; }
+  .pager .info {
+    color: var(--dim); font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .pager .info b { color: var(--paper); font-weight: 500; }
+  .pager .goto { display: flex; align-items: stretch; border: 1px solid var(--rule-2); }
+  .pager .goto input {
+    background: transparent; border: 0; outline: none;
+    color: var(--paper); font: inherit; font-size: 12px;
+    padding: 6px 10px; width: 80px;
+    text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .pager .goto input::-webkit-outer-spin-button,
+  .pager .goto input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .pager .goto button {
+    background: transparent; border: 0; border-left: 1px solid var(--rule-2);
+    color: var(--paper); font: inherit; font-size: 11px;
+    padding: 0 14px; letter-spacing: 0.14em; text-transform: uppercase;
+    cursor: pointer; transition: background .15s, color .15s;
+  }
+  .pager .goto button:hover { background: var(--accent); color: #111; }
+
+  .empty {
+    padding: 28px 0; color: var(--dim); font-size: 13px;
+  }
+
+  /* Filter pills */
+  .filters {
+    display: flex; gap: 0; margin: -4px 0 14px;
+    border: 1px solid var(--rule-2);
+    width: fit-content;
+  }
+  .filters button {
+    background: transparent; border: 0; border-right: 1px solid var(--rule-2);
+    color: var(--dim);
+    font: inherit; font-size: 11px;
+    padding: 8px 14px; letter-spacing: 0.14em; text-transform: uppercase;
+    cursor: pointer; transition: background .15s, color .15s;
+  }
+  .filters button:last-child { border-right: 0; }
+  .filters button:hover { color: var(--paper); }
+  .filters button.active { background: var(--accent); color: #111; }
+  .filters button .n { margin-left: 8px; opacity: .7; font-variant-numeric: tabular-nums; }
+
+  /* Holders */
+  table.holders {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  table.holders th {
+    text-align: left; font-weight: 500;
+    font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim);
+    padding: 8px 0; border-bottom: 1px solid var(--rule);
+  }
+  table.holders td {
+    padding: 12px 0; border-bottom: 1px solid var(--rule);
+    vertical-align: middle;
+  }
+  table.holders td.rank { color: var(--dim); width: 44px; font-variant-numeric: tabular-nums; }
+  table.holders td.addr { white-space: nowrap; }
+  table.holders td.addr a {
+    color: var(--paper);
+    border-bottom: 1px dotted transparent;
+    transition: color .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  table.holders td.bal, table.holders td.rank { white-space: nowrap; }
+  table.holders td.addr a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  table.holders td.share { width: 260px; color: var(--dim); }
+  table.holders td.share .bar {
+    position: relative; height: 2px; background: var(--rule); margin-top: 6px;
+  }
+  table.holders td.share .bar i {
+    position: absolute; inset: 0 auto 0 0;
+    background: var(--paper);
+  }
+  table.holders tr:nth-child(-n+3) td.share .bar i { background: var(--accent); }
+  table.holders td.bal { text-align: right; color: var(--paper); font-variant-numeric: tabular-nums; }
+
+  /* Stats strip */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    border: 1px solid var(--rule);
+  }
+  .stats .cell { padding: 18px 20px; border-right: 1px solid var(--rule); }
+  .stats .cell:last-child { border-right: 0; }
+  .stats .lbl { font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; white-space: nowrap; }
+  .stats .val { font-size: 20px; color: var(--paper); letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+
+  /* Footer */
+  footer {
+    margin-top: 72px; padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--dim); letter-spacing: 0.1em; text-transform: uppercase;
+    flex-wrap: wrap; gap: 12px;
+  }
+  footer a:hover { color: var(--accent); }
+
+  /* Loading */
+  .skel {
+    display: inline-block; min-width: 6ch;
+    background: linear-gradient(90deg, #1a1a1c, #252525, #1a1a1c);
+    background-size: 200% 100%; animation: skel 1.4s infinite;
+    color: transparent; border-radius: 2px;
+  }
+  @keyframes skel { 0%{background-position:200% 0;} 100%{background-position:-200% 0;} }
+
+  /* Wallet view — hide home-only sections */
+  body.viewing-wallet #stats,
+  body.viewing-wallet #transits,
+  body.viewing-wallet #holders,
+  body.viewing-wallet .hero .sub,
+  body.viewing-wallet .hero h1 { display: none; }
+  body.viewing-wallet .hero { padding: 32px 0 8px; }
+  body.viewing-wallet .hero .search { margin-top: 0; }
+
+  @media (max-width: 780px) {
+    .wrap { padding: 20px 18px 60px; }
+    .balances { grid-template-columns: 1fr 1fr; }
+    .balances .cell:nth-child(2) { border-right: 0; }
+    .balances .cell:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
+    .stats { grid-template-columns: 1fr 1fr; }
+    .stats .cell:nth-child(2) { border-right: 0; }
+    .stats .cell:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
+    /* Mobile: hide the TO + time columns. block / type / from / amount. */
+    .list-head, .list li { grid-template-columns: 70px 90px 1fr 140px; gap: 10px; }
+    .list li .t, .list-head .t-h { display: none; }
+    .list li .to, .list-head .to-h { display: none; }
+    table.holders td.share { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <a class="brand" href="#" id="brandHome" role="link" aria-label="Back to home">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="11" fill="none" stroke="rgba(245,245,240,0.35)" stroke-width="0.8"/>
+        <circle cx="16" cy="16" r="3.6" fill="#FFD400"/>
+        <circle cx="16" cy="5" r="1.8" fill="#00A651"/>
+        <circle cx="25" cy="11" r="1.2" fill="#1a1a1e" stroke="rgba(245,245,240,0.3)" stroke-width=".4"/>
+        <circle cx="25" cy="21" r="1.8" fill="#1F4BFF"/>
+        <circle cx="16" cy="27" r="1.2" fill="#1a1a1e" stroke="rgba(245,245,240,0.3)" stroke-width=".4"/>
+        <circle cx="7" cy="21" r="1.8" fill="#E50012"/>
+        <circle cx="7" cy="11" r="1.8" fill="#F2F2F2"/>
+      </svg>
+      <b>NAT</b><span>·</span><span>explorer</span>
+    </a>
+    <div class="tip">
+      <span class="dot"></span>
+      <span>block&nbsp;<b id="tipHeight">—</b></span>
+    </div>
+  </header>
+
+  <section class="hero" id="home">
+    <h1>A non-arbitrary token,<br><em>inscribed into Bitcoin.</em></h1>
+    <p class="sub">Look up any wallet to see its NAT balance and activity. Click any address to follow it.</p>
+
+    <div class="search">
+      <label for="addr">Wallet address</label>
+      <form class="search-row" onsubmit="event.preventDefault(); go();">
+        <input id="addr" type="text" autocomplete="off" spellcheck="false"
+               placeholder="bc1p… / bc1q… / 1… / 3…" />
+        <button type="submit">Look up</button>
+      </form>
+      <div class="hint" id="hint">Try pasting any Bitcoin address.</div>
+    </div>
+  </section>
+
+  <!-- Wallet result -->
+  <section class="wallet" id="wallet">
+    <div class="sec-title">
+      <h2>Wallet</h2>
+      <span class="meta" id="walletMeta"></span>
+    </div>
+    <div class="addr-row">
+      <div class="addr" id="walletAddr"></div>
+      <button class="copy" id="copyBtn" type="button">Copy</button>
+    </div>
+
+    <div class="balances">
+      <div class="cell primary">
+        <div class="lbl">Balance · NAT</div>
+        <div class="val" id="walletTotal" title="—">—</div>
+        <div class="val-exact" id="walletTotalExact"></div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Available</div>
+        <div class="val" id="walletAvail" title="—">—</div>
+        <div class="val-exact" id="walletAvailExact"></div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Transferable</div>
+        <div class="val" id="walletXfer" title="—">—</div>
+        <div class="val-exact" id="walletXferExact"></div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Burned</div>
+        <div class="val" id="walletBurn" title="—">—</div>
+        <div class="val-exact" id="walletBurnExact"></div>
+      </div>
+    </div>
+
+    <div class="sec-title">
+      <h2>Activity</h2>
+      <span class="meta" id="walletActCount"></span>
+    </div>
+    <div class="filters" id="walletFilters" data-scope="wallet">
+      <button data-f="all" class="active">All</button>
+      <button data-f="received">Received</button>
+      <button data-f="sent">Sent</button>
+      <button data-f="mint">Mints</button>
+      <button data-f="other">Other</button>
+    </div>
+    <div class="list-head">
+      <span>Block</span>
+      <span>Type</span>
+      <span>From</span>
+      <span class="to-h">To</span>
+      <span class="amt-h">Amount</span>
+      <span class="t-h">Time</span>
+    </div>
+    <ul class="list" id="walletActivity"></ul>
+    <div class="pager" id="walletPager"></div>
+  </section>
+
+  <!-- Stats -->
+  <section id="stats">
+    <div class="sec-title">
+      <h2>Stats</h2>
+      <span class="meta">NAT · live</span>
+    </div>
+    <div class="stats">
+      <div class="cell">
+        <div class="lbl">Supply</div>
+        <div class="val" id="statSupply">—</div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Holders</div>
+        <div class="val" id="statHolders">—</div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Activation</div>
+        <div class="val">817,709</div>
+      </div>
+      <div class="cell">
+        <div class="lbl">Block</div>
+        <div class="val" id="statTip">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Global activity -->
+  <section id="transits">
+    <div class="sec-title">
+      <h2>Recent activity</h2>
+      <span class="meta">network-wide</span>
+    </div>
+    <div class="filters" id="feedFilters" data-scope="feed">
+      <button data-f="transfers" class="active">Transfers</button>
+      <button data-f="mint">Mints</button>
+      <button data-f="burn">Burns</button>
+    </div>
+    <div class="list-head">
+      <span>Block</span>
+      <span>Type</span>
+      <span>From</span>
+      <span class="to-h">To</span>
+      <span class="amt-h">Amount</span>
+      <span class="t-h">Time</span>
+    </div>
+    <ul class="list" id="feed"></ul>
+    <div class="pager" id="feedPager"></div>
+  </section>
+
+  <!-- Holders -->
+  <section id="holders">
+    <div class="sec-title">
+      <h2>Top holders</h2>
+      <span class="meta">by balance</span>
+    </div>
+    <table class="holders">
+      <thead>
+        <tr><th>#</th><th>Address</th><th>Share</th><th style="text-align:right">Balance</th></tr>
+      </thead>
+      <tbody id="holdersBody"></tbody>
+    </table>
+    <div class="pager" id="holdersPager"></div>
+  </section>
+
+  <footer>
+    <div>NAT explorer · read-only</div>
+    <div><a href="https://digital-matter-theory.gitbook.io/digital-matter-theory" target="_blank" rel="noopener">Digital Matter Theory ↗</a></div>
+  </footer>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  // ------------- formatters -------------
+  const fmt = (n) => {
+    if (n === null || n === undefined) return "—";
+    try { return BigInt(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+    catch { return String(n); }
+  };
+  const shorten = (s, a = 6, b = 6) => !s ? "" : (s.length <= a + b + 3 ? s : s.slice(0, a) + "…" + s.slice(-b));
+  const compact = (n) => {
+    const x = Number(n || 0);
+    if (!isFinite(x)) return "—";
+    const abs = Math.abs(x);
+    const units = [[1e12,"T"],[1e9,"B"],[1e6,"M"],[1e3,"K"]];
+    for (const [v,u] of units) {
+      if (abs >= v) {
+        const q = x / v;
+        const s = (Math.abs(q) >= 100 ? q.toFixed(1) : q.toFixed(2)).replace(/\.?0+$/, "");
+        return s + u;
+      }
+    }
+    return String(x);
+  };
+  const rel = (iso) => {
+    if (!iso) return "";
+    const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return s + "s";
+    const m = Math.floor(s/60); if (m < 60) return m + "m";
+    const h = Math.floor(m/60); if (h < 24) return h + "h";
+    const d = Math.floor(h/24); if (d < 365) return d + "d";
+    return Math.floor(d/365) + "y";
+  };
+
+  async function j(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(url + " → " + r.status);
+    return await r.json();
+  }
+  async function jWithTotal(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(url + " → " + r.status);
+    const total = parseInt(r.headers.get("x-total-count") || "0", 10);
+    const data = await r.json();
+    return { data, total };
+  }
+
+  // ------------- routing (hash-based) -------------
+  function currentAddress() {
+    const h = location.hash || "";
+    const m = h.match(/^#\/?w\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function navTo(address) {
+    location.hash = "#/w/" + encodeURIComponent(address);
+  }
+
+  // Clickable address anywhere → navigate
+  function addrLink(address) {
+    if (!address) return '<span class="none">—</span>';
+    const safe = String(address).replace(/"/g, "");
+    return `<a href="#/w/${encodeURIComponent(safe)}" title="${safe}">${shorten(safe, 10, 8)}</a>`;
+  }
+
+  // ------------- activity rendering -------------
+  // Event → plain-English tag, color class, signed direction, layout kind, and
+  // a tooltip description. "scope" changes wording for transfer rows:
+  //  - wallet scope: tags reflect the user's perspective (Sent/Received)
+  //  - global scope: tags are neutral (Transfer)
+  function classify(ev, scope = "wallet") {
+    const t = ev.event_type || "";
+    switch (t) {
+      case "coinbase_reward_credit":
+        return { tag: "Minted", cls: "mint", dir: "in", kind: "self",
+                 hint: "New NAT minted by a Bitcoin block reward." };
+      case "dmt_mint_credit":
+        return { tag: "Minted", cls: "mint", dir: "in", kind: "self",
+                 hint: "New NAT minted into this wallet." };
+      case "coinbase_reward_burned":
+      case "token_transfer_burned":
+        return { tag: "Burned", cls: "burn", dir: "out", kind: "self",
+                 hint: "NAT destroyed." };
+      case "coinbase_reward_locked":
+        return { tag: "Locked", cls: "info", dir: "", kind: "self",
+                 hint: "Coinbase reward locked." };
+      case "token_transfer_credit":
+        return { tag: "Received", cls: "in", dir: "in", kind: "transfer",
+                 hint: "NAT received from another wallet." };
+      case "token_transfer_debit":
+        return scope === "global"
+          ? { tag: "Transfer", cls: "out", dir: "out", kind: "transfer",
+              hint: "NAT moved from one wallet to another." }
+          : { tag: "Sent", cls: "out", dir: "out", kind: "transfer",
+              hint: "NAT sent to another wallet." };
+      case "token_transfer_inscribe_admitted":
+        return { tag: "Prepared", cls: "info", dir: "", kind: "self",
+                 hint: "Earmarked part of the balance as transferable — ready to send." };
+      case "token_transfer_skipped_semantic":
+        return { tag: "Voided", cls: "info", dir: "", kind: "self",
+                 hint: "A transfer attempt was voided by protocol rules." };
+      case "block_transferables_inscribed":
+      case "block_transferables_tapped":
+        return { tag: "Locked", cls: "info", dir: "", kind: "self",
+                 hint: "Transferables were locked for this wallet." };
+      case "unblock_transferables_inscribed":
+      case "unblock_transferables_tapped":
+        return { tag: "Unlocked", cls: "info", dir: "", kind: "self",
+                 hint: "Transferables were unlocked for this wallet." };
+      case "dmt_mint_duplicate_rejected":
+      case "dmt_mint_ignored_post_activation":
+        return { tag: "Rejected", cls: "info", dir: "", kind: "self",
+                 hint: "A mint attempt was rejected by protocol rules." };
+      case "dmt_deploy_registered":
+        return { tag: "Deployed", cls: "info", dir: "", kind: "self",
+                 hint: "Deployment of a NAT ticker." };
+      default:
+        return { tag: "Event", cls: "info", dir: "", kind: "self", hint: t };
+    }
+  }
+
+  // Resolve (from, to) for every event so rows always have two address
+  // cells. Null means "nothing on that side" (rendered as "—").
+  function fromTo(ev) {
+    const t = ev.event_type || "";
+    const subject = ev.address || null;
+    const other = ev.counterparty_address || null;
+    switch (t) {
+      case "token_transfer_credit":            return { from: other,   to: subject };
+      case "token_transfer_debit":             return { from: subject, to: other };
+      case "coinbase_reward_credit":
+      case "dmt_mint_credit":                  return { from: null,    to: subject }; // minted into wallet
+      case "coinbase_reward_burned":
+      case "token_transfer_burned":            return { from: subject, to: null };    // burned from wallet
+      case "coinbase_reward_locked":           return { from: null,    to: subject };
+      case "token_transfer_inscribe_admitted": return { from: subject, to: subject }; // self-staged
+      case "token_transfer_skipped_semantic":  return { from: subject, to: null };
+      case "block_transferables_inscribed":
+      case "block_transferables_tapped":
+      case "unblock_transferables_inscribed":
+      case "unblock_transferables_tapped":     return { from: null,    to: subject };
+      case "dmt_deploy_registered":            return { from: null,    to: subject };
+      default:                                 return { from: other,   to: subject };
+    }
+  }
+
+  // Render from + to as two direct grid children. Nulls become "—".
+  function whoCells(ev, selfAddr = null) {
+    const isSelf = (a) => selfAddr && a && a.toLowerCase() === selfAddr.toLowerCase();
+    const addr = (a) => !a
+      ? `<span class="none">—</span>`
+      : (isSelf(a)
+          ? `<span class="self-you" title="${a}">you</span>`
+          : `<a href="#/w/${encodeURIComponent(a)}" title="${a}">${shorten(a, 8, 6)}</a>`);
+    const { from, to } = fromTo(ev);
+    return `<span class="from">${addr(from)}</span><span class="to">${addr(to)}</span>`;
+  }
+
+  // mempool.space URL for this event: prefer tx, fall back to block.
+  function mempoolUrl(ev) {
+    if (ev.txid) return `https://mempool.space/tx/${ev.txid}`;
+    if (ev.inscription_id) {
+      const txid = String(ev.inscription_id).replace(/i\d+$/, "");
+      if (/^[0-9a-f]{64}$/i.test(txid)) return `https://mempool.space/tx/${txid}`;
+    }
+    if (ev.block_hash) return `https://mempool.space/block/${ev.block_hash}`;
+    if (ev.block_height !== undefined) return `https://mempool.space/block/${ev.block_height}`;
+    return null;
+  }
+
+  function renderRow(ev, opts = {}) {
+    const { selfAddr = null, scope = "wallet" } = opts;
+    const k = classify(ev, scope);
+    const amt = Number(ev.metadata?.amount ?? Math.abs(ev.delta?.delta_total ?? 0));
+    const sign = k.dir === "out" ? "−" : (k.dir === "in" ? "+" : "");
+    const amtStr = amt ? (sign + fmt(amt)) : "—";
+    const url = mempoolUrl(ev);
+    const timeLabel = rel(ev.occurred_at);
+    const timeTitle = new Date(ev.occurred_at).toLocaleString();
+    const timeCell = url
+      ? `<a href="${url}" target="_blank" rel="noopener" title="${timeTitle} · open on mempool.space">${timeLabel}</a>`
+      : `<span title="${timeTitle}">${timeLabel}</span>`;
+    return `<li>
+      <span class="blk">${fmt(ev.block_height)}</span>
+      <span class="tag ${k.cls}" title="${k.hint}">${k.tag}</span>
+      ${whoCells(ev, selfAddr)}
+      <span class="amt ${k.cls}">${amtStr}</span>
+      <span class="t">${timeCell}</span>
+    </li>`;
+  }
+
+  // ------------- status -------------
+  async function loadStatus() {
+    try {
+      const s = await j("/status");
+      const nat = (s.deployments || []).find(d => d.ticker === "nat") || {};
+      $("tipHeight").textContent = fmt(s.tip_height);
+      $("statTip").textContent = fmt(s.tip_height);
+      $("statSupply").textContent = fmt(nat.total_supply ?? 0);
+      $("statHolders").textContent = fmt(nat.holder_count ?? 0);
+    } catch (_) {}
+  }
+
+  // ------------- paginated, server-filtered activity -------------
+  const PAGE = 25;
+
+  const state = {
+    feed:    { events: [], filter: "transfers", page: 1, total: 0, loading: false },
+    wallet:  { events: [], filter: "all",       page: 1, total: 0, loading: false, address: null },
+    holders: { rows: [],  page: 1, total: 0, loading: false, supply: 0 },
+  };
+  const HOLDERS_PAGE = 20;
+
+  function filterQS(f) {
+    return f && f !== "all" ? `&family=${encodeURIComponent(f)}` : "";
+  }
+  const totalPages = (total) => Math.max(1, Math.ceil(total / PAGE));
+
+  async function fetchFeedPage(page) {
+    const f = state.feed.filter;
+    const offset = (page - 1) * PAGE;
+    const url = `/activity?ticker=nat&limit=${PAGE}&offset=${offset}${filterQS(f)}`;
+    return await jWithTotal(url);
+  }
+  async function fetchWalletPage(address, page) {
+    const f = state.wallet.filter;
+    const offset = (page - 1) * PAGE;
+    const url = `/wallets/${encodeURIComponent(address)}/activity?ticker=nat&limit=${PAGE}&offset=${offset}${filterQS(f)}`;
+    return await jWithTotal(url);
+  }
+
+  function renderFeed() {
+    const { events, filter, loading } = state.feed;
+    $("feed").innerHTML = events.length
+      ? events.map(ev => renderRow(ev, { scope: "global" })).join("")
+      : (loading ? `<li class="empty">Loading…</li>` : `<li class="empty">No ${filter} found.</li>`);
+    renderPager("feedPager", state.feed, gotoFeedPage);
+  }
+  function renderWalletActivity() {
+    const { events, filter, loading, address } = state.wallet;
+    $("walletActivity").innerHTML = events.length
+      ? events.map(ev => renderRow(ev, { selfAddr: address, scope: "wallet" })).join("")
+      : (loading ? `<li class="empty">Loading…</li>` : `<li class="empty">No ${filter === "all" ? "" : filter + " "}activity for this wallet.</li>`);
+    $("walletActCount").textContent = state.wallet.total
+      ? `${fmt(state.wallet.total)} total`
+      : (events.length ? `${events.length} shown` : "");
+    renderPager("walletPager", state.wallet, gotoWalletPage);
+  }
+
+  function renderPager(rootId, st, go) {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    const pages = totalPages(st.total);
+    if (!st.total) { root.innerHTML = ""; return; }
+    const p = st.page;
+    const atFirst = p <= 1 || st.loading;
+    const atLast  = p >= pages || st.loading;
+    root.innerHTML = `
+      <div class="group">
+        <button data-go="1"            ${atFirst ? "disabled" : ""} title="First page">« First</button>
+        <button data-go="${p - 1}"     ${atFirst ? "disabled" : ""} title="Previous page">‹ Prev</button>
+        <button data-go="${p + 1}"     ${atLast  ? "disabled" : ""} title="Next page">Next ›</button>
+        <button data-go="${pages}"     ${atLast  ? "disabled" : ""} title="Last page — oldest events">Last »</button>
+      </div>
+      <span class="info">Page <b>${fmt(p)}</b> of <b>${fmt(pages)}</b> · <b>${fmt(st.total)}</b> total</span>
+      <form class="goto" onsubmit="event.preventDefault(); this.dispatchEvent(new CustomEvent('go', { bubbles: true, detail: parseInt(this.querySelector('input').value || '0', 10) }));">
+        <input type="number" min="1" max="${pages}" placeholder="Page…" />
+        <button type="submit">Go</button>
+      </form>
+    `;
+    root.querySelectorAll("button[data-go]").forEach(b => {
+      b.addEventListener("click", () => go(parseInt(b.getAttribute("data-go"), 10)));
+    });
+    root.querySelector("form.goto").addEventListener("go", (e) => {
+      const target = Number(e.detail);
+      if (Number.isFinite(target) && target >= 1 && target <= pages) go(target);
+    });
+  }
+
+  async function gotoFeedPage(page) {
+    if (!Number.isFinite(page) || page < 1) page = 1;
+    if (state.feed.loading) return;
+    state.feed.loading = true; state.feed.page = page;
+    renderFeed();
+    try {
+      const { data, total } = await fetchFeedPage(page);
+      state.feed.events = data;
+      state.feed.total = total;
+      // If total changed under us, clamp the page.
+      const pages = totalPages(total);
+      if (state.feed.page > pages) state.feed.page = pages;
+    } catch (_) {
+      $("feed").innerHTML = `<li class="empty" style="color:var(--debit)">Feed unavailable.</li>`;
+    } finally {
+      state.feed.loading = false;
+      renderFeed();
+    }
+  }
+  async function gotoWalletPage(page) {
+    const addr = state.wallet.address;
+    if (!addr) return;
+    if (!Number.isFinite(page) || page < 1) page = 1;
+    if (state.wallet.loading) return;
+    state.wallet.loading = true; state.wallet.page = page;
+    renderWalletActivity();
+    try {
+      const { data, total } = await fetchWalletPage(addr, page);
+      state.wallet.events = data;
+      state.wallet.total = total;
+      const pages = totalPages(total);
+      if (state.wallet.page > pages) state.wallet.page = pages;
+    } catch (_) {
+      $("walletActivity").innerHTML = `<li class="empty" style="color:var(--debit)">Activity unavailable.</li>`;
+    } finally {
+      state.wallet.loading = false;
+      renderWalletActivity();
+    }
+  }
+
+  function loadFeedReset() {
+    state.feed.events = []; state.feed.total = 0; state.feed.page = 1;
+    return gotoFeedPage(1);
+  }
+  function loadWalletActivityReset() {
+    state.wallet.events = []; state.wallet.total = 0; state.wallet.page = 1;
+    return gotoWalletPage(1);
+  }
+
+  function wireFilters(rootId, scope, onChange) {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    root.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-f]");
+      if (!btn) return;
+      root.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      state[scope].filter = btn.getAttribute("data-f");
+      onChange();
+    });
+  }
+
+  // ------------- holders (paginated) -------------
+  function renderHolders() {
+    const { rows, page, loading, supply } = state.holders;
+    const startRank = (page - 1) * HOLDERS_PAGE;
+    $("holdersBody").innerHTML = rows.length
+      ? rows.map((r, i) => {
+          const share = supply > 0 ? (Number(r.total) / supply) * 100 : 0;
+          return `<tr>
+            <td class="rank">${String(startRank + i + 1).padStart(2, "0")}</td>
+            <td class="addr"><a href="#/w/${encodeURIComponent(r.address)}">${shorten(r.address, 12, 10)}</a></td>
+            <td class="share">
+              <div style="display:flex; justify-content:space-between;"><span>${share.toFixed(3)}%</span></div>
+              <div class="bar"><i style="width:${Math.min(100, share * 4).toFixed(2)}%"></i></div>
+            </td>
+            <td class="bal">${fmt(r.total)}</td>
+          </tr>`;
+        }).join("")
+      : `<tr><td colspan="4" class="empty">${loading ? "Loading…" : "No holders found."}</td></tr>`;
+
+    renderPagerCustom("holdersPager", state.holders, HOLDERS_PAGE, gotoHoldersPage);
+  }
+
+  // Holders pager uses a different page size than activity, so it calls a
+  // thin wrapper that passes the right size.
+  function renderPagerCustom(rootId, st, pageSize, go) {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    const pages = Math.max(1, Math.ceil((st.total || 0) / pageSize));
+    if (!st.total) { root.innerHTML = ""; return; }
+    const p = st.page;
+    const atFirst = p <= 1 || st.loading;
+    const atLast  = p >= pages || st.loading;
+    root.innerHTML = `
+      <div class="group">
+        <button data-go="1"            ${atFirst ? "disabled" : ""} title="First page">« First</button>
+        <button data-go="${p - 1}"     ${atFirst ? "disabled" : ""} title="Previous page">‹ Prev</button>
+        <button data-go="${p + 1}"     ${atLast  ? "disabled" : ""} title="Next page">Next ›</button>
+        <button data-go="${pages}"     ${atLast  ? "disabled" : ""} title="Last page">Last »</button>
+      </div>
+      <span class="info">Page <b>${fmt(p)}</b> of <b>${fmt(pages)}</b> · <b>${fmt(st.total)}</b> total</span>
+      <form class="goto" onsubmit="event.preventDefault(); this.dispatchEvent(new CustomEvent('go', { bubbles: true, detail: parseInt(this.querySelector('input').value || '0', 10) }));">
+        <input type="number" min="1" max="${pages}" placeholder="Page…" />
+        <button type="submit">Go</button>
+      </form>
+    `;
+    root.querySelectorAll("button[data-go]").forEach(b => {
+      b.addEventListener("click", () => go(parseInt(b.getAttribute("data-go"), 10)));
+    });
+    root.querySelector("form.goto").addEventListener("go", (e) => {
+      const target = Number(e.detail);
+      if (Number.isFinite(target) && target >= 1 && target <= pages) go(target);
+    });
+  }
+
+  async function gotoHoldersPage(page) {
+    if (!Number.isFinite(page) || page < 1) page = 1;
+    if (state.holders.loading) return;
+    state.holders.loading = true; state.holders.page = page;
+    renderHolders();
+    try {
+      const offset = (page - 1) * HOLDERS_PAGE;
+      const { data, total } = await jWithTotal(`/holders?ticker=nat&limit=${HOLDERS_PAGE}&offset=${offset}`);
+      state.holders.rows = data;
+      state.holders.total = total;
+      if (state.holders.supply === 0) {
+        try {
+          const st = await j("/status");
+          const nat = (st.deployments || []).find(d => d.ticker === "nat") || {};
+          state.holders.supply = Number(nat.total_supply) || 1;
+        } catch (_) { state.holders.supply = 1; }
+      }
+      const pages = Math.max(1, Math.ceil(total / HOLDERS_PAGE));
+      if (state.holders.page > pages) state.holders.page = pages;
+    } catch (_) {
+      $("holdersBody").innerHTML = `<tr><td colspan="4" class="empty" style="color:var(--debit)">Holders unavailable.</td></tr>`;
+    } finally {
+      state.holders.loading = false;
+      renderHolders();
+    }
+  }
+  function loadHolders() { return gotoHoldersPage(1); }
+
+  // ------------- wallet lookup -------------
+  async function loadWallet(address) {
+    const hint = $("hint"); hint.classList.remove("err");
+    hint.textContent = "Looking up…";
+    $("addr").value = address;
+    try {
+      const w = await j("/wallets/" + encodeURIComponent(address));
+      const nat = (w.balances || []).find(b => b.ticker === "nat") || { total: 0, available: 0, transferable: 0, burned: 0 };
+
+      $("walletAddr").textContent = w.address;
+      $("walletMeta").textContent = "";
+      const setBalance = (valEl, exactEl, n) => {
+        const full = fmt(n);
+        const short = compact(n);
+        const el = $(valEl);
+        // If the full number is reasonably short, show it; otherwise show compact.
+        if (full.length <= 13) {
+          el.textContent = full;
+          $(exactEl).textContent = "";
+        } else {
+          el.textContent = short;
+          $(exactEl).textContent = full;
+        }
+        el.title = full;
+      };
+      setBalance("walletTotal", "walletTotalExact", nat.total);
+      setBalance("walletAvail", "walletAvailExact", nat.available);
+      setBalance("walletXfer",  "walletXferExact",  nat.transferable);
+      setBalance("walletBurn",  "walletBurnExact",  nat.burned);
+
+      state.wallet.filter = "all";
+      state.wallet.address = w.address;
+      document.querySelectorAll("#walletFilters button").forEach(b =>
+        b.classList.toggle("active", b.getAttribute("data-f") === "all"));
+      loadWalletActivityReset();
+
+      $("wallet").classList.add("active");
+      hint.textContent = Number(nat.total) > 0
+        ? "Resolved. Scroll to see activity."
+        : "Resolved. No current balance.";
+      $("wallet").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      $("wallet").classList.remove("active");
+      hint.textContent = "Could not resolve wallet. Check the address format.";
+      hint.classList.add("err");
+    }
+  }
+
+  function go() {
+    const v = $("addr").value.trim();
+    if (!v) {
+      const hint = $("hint");
+      hint.textContent = "Enter an address first.";
+      hint.classList.add("err");
+      return;
+    }
+    navTo(v);
+  }
+
+  $("copyBtn").addEventListener("click", async () => {
+    const a = $("walletAddr").textContent.trim();
+    if (!a) return;
+    try {
+      await navigator.clipboard.writeText(a);
+      $("copyBtn").textContent = "Copied";
+      setTimeout(() => ($("copyBtn").textContent = "Copy"), 1200);
+    } catch { /* ignore */ }
+  });
+
+  $("addr").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); go(); }
+  });
+
+  // Brand link = go home (clear hash, keep history clean)
+  document.getElementById("brandHome").addEventListener("click", (e) => {
+    e.preventDefault();
+    if (location.hash) {
+      history.pushState("", document.title, location.pathname + location.search);
+      handleRoute();
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+
+  // React to hash changes (forward/back, internal links)
+  function handleRoute() {
+    const addr = currentAddress();
+    if (addr) {
+      document.body.classList.add("viewing-wallet");
+      loadWallet(addr);
+    } else {
+      document.body.classList.remove("viewing-wallet");
+      $("wallet").classList.remove("active");
+      $("addr").value = "";
+    }
+  }
+  window.addEventListener("hashchange", handleRoute);
+
+  // Filter pill clicks: reset + reload with server-side filter
+  wireFilters("feedFilters", "feed", loadFeedReset);
+  wireFilters("walletFilters", "wallet", loadWalletActivityReset);
+
+  // Boot
+  loadStatus();
+  loadFeedReset();
+  loadHolders();
+  handleRoute();
+  setInterval(loadStatus, 30000);
+</script>
+</body>
+</html>

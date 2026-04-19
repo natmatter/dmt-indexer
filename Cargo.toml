@@ -1,0 +1,65 @@
+[package]
+name = "dmt-indexer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A standalone DMT / TAP indexer that reads Bitcoin Core directly and writes a single embedded redb file."
+repository = "https://github.com/natmatter/dmt-indexer"
+readme = "README.md"
+keywords = ["bitcoin", "ordinals", "tap", "dmt", "indexer"]
+categories = ["cryptography::cryptocurrencies", "command-line-utilities"]
+
+[[bin]]
+name = "dmt-indexer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+bitcoin = { version = "0.32", features = ["serde"] }
+brotli = { version = "7", default-features = false, features = ["std"] }
+bytes = "1"
+rayon = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+http = "1"
+prometheus = "0.13"
+redb = "2.2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5"
+
+# Optional: enable --against-postgres conformance at compile time.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "chrono", "bigdecimal"], optional = true }
+
+[features]
+default = ["verify-postgres"]
+verify-postgres = ["dep:sqlx"]
+brotli-content = []
+
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std"]
+
+[dependencies.tempfile]
+version = "3"
+
+[dev-dependencies]
+hex-literal = "0.4"
+pretty_assertions = "1"
+tempfile = "3"

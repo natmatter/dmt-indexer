@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build
+        run: cargo build --all-targets --no-default-features
+      - name: Test
+        run: cargo test --no-default-features
+      # Clippy runs advisory for now — existing codebase has pre-fmt
+      # warnings that aren't blockers. Tighten with `-D warnings` once
+      # they're worked through.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets --no-default-features || true

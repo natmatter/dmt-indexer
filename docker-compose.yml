@@ -1,0 +1,19 @@
+services:
+  dmt-indexer:
+    build: .
+    image: ghcr.io/natmatter/dmt-indexer:latest
+    container_name: dmt-indexer
+    restart: unless-stopped
+    volumes:
+      - dmt_data:/var/lib/dmt-indexer
+      - ./config.toml:/etc/dmt-indexer/config.toml:ro
+      # Bitcoin Core cookie for RPC auth. Adjust for your node.
+      - /var/lib/bitcoind/.cookie:/bitcoind.cookie:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      RUST_LOG: "info,dmt_indexer=info"
+    command: ["run", "--config", "/etc/dmt-indexer/config.toml"]
+
+volumes:
+  dmt_data:
