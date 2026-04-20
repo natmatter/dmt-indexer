@@ -451,19 +451,90 @@
   body.viewing-wallet .hero { padding: 32px 0 8px; }
   body.viewing-wallet .hero .search { margin-top: 0; }
 
+  /* ---------- Mobile (≤ 780px) ---------- */
   @media (max-width: 780px) {
-    .wrap { padding: 20px 18px 60px; }
+    .wrap { padding: 18px 16px 56px; }
+    section { margin-top: 40px; }
+    .hero { padding: 36px 0 20px; }
+    .hero .sub { white-space: normal; }
+
+    header { padding-bottom: 18px; }
+    .head-right { gap: 12px; }
+    .head-link { padding: 5px 9px; }
+
+    /* Stats + balances: 2 columns on mobile. */
     .balances { grid-template-columns: 1fr 1fr; }
     .balances .cell:nth-child(2) { border-right: 0; }
     .balances .cell:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
+    .balances .cell { padding: 16px 14px; }
+    .balances .val { font-size: clamp(18px, 5vw, 24px); }
+
     .stats { grid-template-columns: 1fr 1fr; }
     .stats .cell:nth-child(2) { border-right: 0; }
     .stats .cell:nth-child(-n+2) { border-bottom: 1px solid var(--rule); }
-    /* Mobile: hide the TO + time columns. block / type / from / amount. */
-    .list-head, .list li { grid-template-columns: 70px 90px 1fr 140px; gap: 10px; }
-    .list li .t, .list-head .t-h { display: none; }
-    .list li .to, .list-head .to-h { display: none; }
-    table.holders td.share { display: none; }
+    .stats .cell { padding: 14px 14px; }
+    .stats .val { font-size: 16px; }
+
+    /* Activity list: stack from 6-col grid to a card layout so we don't
+       drop any column on small screens. Layout per row:
+           [tag]                          [amount]
+           from: bc1q… → bc1p…
+           #block                             time
+       block + time are the bottom metadata line; tag + amount anchor the
+       top; addresses take the full width between. */
+    .list-head { display: none; }
+    .list li {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-areas:
+        "tag    amount"
+        "from   from"
+        "to     to"
+        "block  time";
+      row-gap: 3px;
+      column-gap: 12px;
+      padding: 12px 2px;
+      align-items: center;
+    }
+    .list li .tag  { grid-area: tag;    justify-self: start; }
+    .list li .amt  { grid-area: amount; justify-self: end; font-size: 16px; font-weight: 500; }
+    .list li .from { grid-area: from;   font-size: 12px; }
+    .list li .to   { grid-area: to;     font-size: 12px; }
+    .list li .to::before { content: "→ "; color: var(--dim-2); margin-right: 4px; }
+    .list li .blk  { grid-area: block;  font-size: 10px; color: var(--dim-2); }
+    .list li .t    { grid-area: time;   font-size: 10px; color: var(--dim); justify-self: end; }
+
+    /* Holders: keep every column, drop the visual share bar — the
+       percentage reading is enough on a small screen. */
+    table.holders td.share .bar { display: none; }
+    table.holders td.share { min-width: 0; }
+    table.holders th, table.holders td { padding: 10px 6px; font-size: 12px; }
+    table.holders td.rank { font-size: 11px; color: var(--dim); }
+    table.holders td.bal  { font-size: 12px; }
+
+    /* Wallet card: tighten title + addr row. */
+    .wallet .addr-row { gap: 8px; margin-bottom: 18px; }
+
+    /* Search: pill becomes full-width, button wraps under input on
+       very tight viewports via the 480px breakpoint below. */
+    .search input { padding: 14px 14px; font-size: 14px; }
+    .search button { padding: 0 16px; font-size: 11px; }
+  }
+
+  /* ---------- Very small (≤ 480px) — iPhone SE / narrow Android ---------- */
+  @media (max-width: 480px) {
+    .wrap { padding: 14px 12px 48px; }
+    .balances { grid-template-columns: 1fr; }
+    .balances .cell { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .balances .cell:last-child { border-bottom: 0; }
+    .stats { grid-template-columns: 1fr; }
+    .stats .cell { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .stats .cell:last-child { border-bottom: 0; }
+    .head-link span { display: none; }              /* icon-only GitHub link */
+    .search-row { flex-direction: column; }
+    .search-row button { border-left: 0; border-top: 1px solid var(--rule-2); padding: 12px; }
+    .sec-title h2 { font-size: 12px; }
+    .sec-title .meta { font-size: 10px; }
   }
 </style>
 </head>
