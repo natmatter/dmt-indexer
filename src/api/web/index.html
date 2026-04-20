@@ -406,6 +406,12 @@
   .stats .cell:last-child { border-right: 0; }
   .stats .lbl { font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); margin-bottom: 8px; white-space: nowrap; }
   .stats .val { font-size: 20px; color: var(--paper); letter-spacing: -0.005em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .stats .cell .val-exact {
+    margin-top: 4px;
+    font-size: 11px; color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums; letter-spacing: 0;
+  }
 
   /* Footer */
   footer {
@@ -572,6 +578,7 @@
       <div class="cell">
         <div class="lbl">Supply</div>
         <div class="val" id="statSupply">—</div>
+        <div class="val-exact" id="statSupplyExact"></div>
       </div>
       <div class="cell">
         <div class="lbl">Holders</div>
@@ -834,7 +841,19 @@
       const nat = (s.deployments || []).find(d => d.ticker === "nat") || {};
       $("tipHeight").textContent = fmt(s.tip_height);
       $("statTip").textContent = fmt(s.tip_height);
-      $("statSupply").textContent = fmt(nat.total_supply ?? 0);
+      const supply = Number(nat.total_supply ?? 0);
+      const supplyFull = fmt(supply);
+      const supplyShort = compact(supply);
+      const supplyEl = $("statSupply");
+      const supplyExact = $("statSupplyExact");
+      if (supplyFull.length <= 13) {
+        supplyEl.textContent = supplyFull;
+        supplyExact.textContent = "";
+      } else {
+        supplyEl.textContent = supplyShort;
+        supplyExact.textContent = supplyFull;
+      }
+      supplyEl.title = supplyFull;
       $("statHolders").textContent = fmt(nat.holder_count ?? 0);
     } catch (_) {}
   }
