@@ -39,10 +39,7 @@ struct ExportQuery {
     limit: Option<u32>,
 }
 
-async fn export_handler(
-    State(s): State<Arc<AppState>>,
-    Query(q): Query<ExportQuery>,
-) -> Response {
+async fn export_handler(State(s): State<Arc<AppState>>, Query(q): Query<ExportQuery>) -> Response {
     let limit = q
         .limit
         .unwrap_or(s.cfg.api.max_page_size)

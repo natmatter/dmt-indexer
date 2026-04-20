@@ -39,7 +39,9 @@ struct CursorQuery {
     #[serde(default = "default_recent")]
     recent: usize,
 }
-fn default_recent() -> usize { 20 }
+fn default_recent() -> usize {
+    20
+}
 
 #[derive(Serialize)]
 struct CursorBody {
@@ -55,10 +57,7 @@ struct RecentBlock {
     hash: String,
 }
 
-async fn cursor_handler(
-    State(s): State<Arc<AppState>>,
-    Query(q): Query<CursorQuery>,
-) -> Response {
+async fn cursor_handler(State(s): State<Arc<AppState>>, Query(q): Query<CursorQuery>) -> Response {
     let want_recent = q.recent.clamp(1, 256);
     let rtx = match s.store.read() {
         Ok(t) => t,
@@ -101,7 +100,9 @@ async fn cursor_handler(
                 // row only — which we already did.
                 break;
             }
-            let Ok(ev) = decode::<LedgerEvent>(v.value()) else { continue };
+            let Ok(ev) = decode::<LedgerEvent>(v.value()) else {
+                continue;
+            };
             if seen.insert(ev.block_height) {
                 recent_blocks.push(RecentBlock {
                     height: ev.block_height,
