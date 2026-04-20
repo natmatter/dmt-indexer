@@ -1,5 +1,7 @@
 pub mod activity;
 pub mod cache;
+pub mod cursor;
+pub mod export;
 pub mod holders;
 pub mod inscriptions;
 pub mod ratelimit;
@@ -34,6 +36,8 @@ pub fn build_router(cfg: &Config, handle: SyncHandle) -> Result<Router> {
         .merge(status::routes())
         .merge(holders::routes())
         .merge(activity::routes())
+        .merge(cursor::routes())
+        .merge(export::routes())
         .merge(wallets::routes())
         .merge(inscriptions::routes())
         .merge(ws::routes())
