@@ -5,6 +5,10 @@
 [bitcoin]
 rpc_url = "http://127.0.0.1:8332"
 # Use either cookie_file OR rpc_user + rpc_password.
+# Bitcoin Core's default cookie location by OS:
+#   Linux   : /home/<user>/.bitcoin/.cookie  (or /var/lib/bitcoind/.cookie for a systemd install)
+#   macOS   : /Users/<user>/Library/Application Support/Bitcoin/.cookie
+#   Windows : C:\Users\<user>\AppData\Roaming\Bitcoin\.cookie
 cookie_file = "/var/lib/bitcoind/.cookie"
 # rpc_user     = "bitcoin"
 # rpc_password = "change-me"
@@ -12,6 +16,10 @@ cookie_file = "/var/lib/bitcoind/.cookie"
 timeout_secs = 60
 
 [storage]
+# Any writable path works. Suggested defaults:
+#   Linux   : /var/lib/dmt-indexer/index.redb
+#   macOS   : /Users/<user>/Library/Application Support/dmt-indexer/index.redb
+#   Windows : C:\ProgramData\dmt-indexer\index.redb
 db_path = "/var/lib/dmt-indexer/index.redb"
 
 [sync]

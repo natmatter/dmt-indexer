@@ -1,0 +1,119 @@
+name: release
+
+# Fires on annotated tag pushes like `v0.1.0`. Builds a binary for each
+# target in the matrix, bundles the README / LICENSE / example config,
+# and attaches the archives (+ a single combined SHA256SUMS) to the
+# GitHub Release for that tag. GitHub auto-attaches the source tarballs
+# separately, so no manual source bundling is needed.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries are deployable as-is — skip the optional
+  # verify-postgres feature so we don't drag in PG client libs.
+  CARGO_FLAGS: --release --locked --no-default-features
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,  cross: false }
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  cross: true  }
+          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest,  cross: true  }
+          - { target: x86_64-apple-darwin,        os: macos-latest,   cross: false }
+          - { target: aarch64-apple-darwin,       os: macos-latest,   cross: false }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest, cross: false }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: cargo build $CARGO_FLAGS --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        shell: bash
+        run: cross build $CARGO_FLAGS --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          staging="dmt-indexer-${tag}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/dmt-indexer" "$staging/"
+          cp README.md LICENSE config.example.toml "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          $staging = "dmt-indexer-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/dmt-indexer.exe" -Destination $staging
+          Copy-Item README.md, LICENSE, config.example.toml -Destination $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$staging.zip").Hash.ToLower()
+          "$hash  $staging.zip" | Out-File -Encoding ASCII "$staging.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dmt-indexer-*.tar.gz
+            dmt-indexer-*.zip
+            *.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Build combined SHA256SUMS
+        working-directory: artifacts
+        run: |
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          rm -f *.sha256
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
