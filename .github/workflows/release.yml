@@ -26,14 +26,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # `target` is the Rust target triple (what rustc cares about);
+      # `name`   is the friendly slug baked into the artifact filename.
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,  cross: false }
-          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  cross: true  }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-latest,  cross: true  }
-          - { target: x86_64-apple-darwin,        os: macos-latest,   cross: false }
-          - { target: aarch64-apple-darwin,       os: macos-latest,   cross: false }
-          - { target: x86_64-pc-windows-msvc,     os: windows-latest, cross: false }
+          - { target: x86_64-unknown-linux-gnu,   name: linux-x86_64,       os: ubuntu-latest,  cross: false }
+          - { target: x86_64-unknown-linux-musl,  name: linux-x86_64-musl,  os: ubuntu-latest,  cross: true  }
+          - { target: aarch64-unknown-linux-gnu,  name: linux-aarch64,      os: ubuntu-latest,  cross: true  }
+          - { target: x86_64-apple-darwin,        name: macos-x86_64,       os: macos-latest,   cross: false }
+          - { target: aarch64-apple-darwin,       name: macos-aarch64,      os: macos-latest,   cross: false }
+          - { target: x86_64-pc-windows-msvc,     name: windows-x86_64,     os: windows-latest, cross: false }
 
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +75,7 @@ jobs:
         shell: bash
         run: |
           tag="${GITHUB_REF_NAME}"
-          staging="dmt-indexer-${tag}-${{ matrix.target }}"
+          staging="dmt-indexer-${tag}-${{ matrix.name }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/dmt-indexer" "$staging/"
           cp README.md LICENSE config.example.toml "$staging/"
@@ -85,7 +87,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${env:GITHUB_REF_NAME}"
-          $staging = "dmt-indexer-$tag-${{ matrix.target }}"
+          $staging = "dmt-indexer-$tag-${{ matrix.name }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/dmt-indexer.exe" -Destination $staging
           Copy-Item README.md, LICENSE, config.example.toml -Destination $staging
@@ -95,7 +97,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.name }}
           path: |
             dmt-indexer-*.tar.gz
             dmt-indexer-*.zip
