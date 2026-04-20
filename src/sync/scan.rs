@@ -512,6 +512,14 @@ impl Syncer {
         for pre in &pre_parsed {
             let tx_index = pre.tx_index;
             let txv = &block.txs[tx_index as usize];
+            // Snapshot fresh_carriers length before this tx so we can
+            // register just this tx's new inscriptions into the tracker
+            // after its own spend-check pass. Required for same-block
+            // inscribe+move: tx A reveals an inscription, tx B later in
+            // the same block spends that reveal UTXO. Without this, B's
+            // spend check never matches because the carrier wasn't in
+            // the tracker yet.
+            let carriers_before = fresh_carriers.len();
             for pe in &pre.envelopes {
                 // Per ord's default landing rule: envelope K's inscription
                 // sits on the first sat of output K. TAP credits the mint
@@ -755,8 +763,11 @@ impl Syncer {
                     }
                 }
             }
-            // Carrier movement for this tx. We skip txs that don't
-            // spend any tracked outpoint so we avoid RPC round-trips.
+            // Carrier movement for this tx. Runs BEFORE registering
+            // this tx's own fresh carriers — a tx cannot spend its own
+            // outputs, so nothing this tx just inscribed can be moved
+            // by this tx. Skip the RPC round-trip when no input matches
+            // a tracked outpoint.
             let spends_tracked = txv
                 .tx
                 .input
@@ -771,12 +782,16 @@ impl Syncer {
                     moves.push((tx_index, m));
                 }
             }
-        }
 
-        // Register fresh carriers from THIS block AFTER movement pass
-        // so they don't get swept if the reveal tx has unusual structure.
-        for (outpoint, carrier, _addr) in &fresh_carriers {
-            tracker.insert(*outpoint, carrier.clone());
+            // Register THIS tx's new carriers so subsequent txs in the
+            // same block can detect them as move targets. Without this
+            // step, same-block inscribe+move patterns silently lose
+            // the move event, leaving the inscription stuck on the
+            // inscriber in our tracker while the ledger shows no debit
+            // and the recipient no credit.
+            for (outpoint, carrier, _addr) in &fresh_carriers[carriers_before..] {
+                tracker.insert(*outpoint, carrier.clone());
+            }
         }
 
         // Resolve transfer inscribes serially
