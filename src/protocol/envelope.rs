@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::inscription::envelope::Envelope;
+use crate::protocol::auth::{parse_auth, TokenAuthPayload};
 use crate::protocol::control::{parse_control, ControlPayload};
 use crate::protocol::deploy::{parse_deploy, DeployPayload};
 use crate::protocol::mint::{parse_mint, MintPayload};
 use crate::protocol::send::{parse_send, TokenSendPayload};
 use crate::protocol::tap::{decode_envelope, TapOp};
+use crate::protocol::trade::{parse_trade, TokenTradePayload};
 use crate::protocol::transfer::{parse_transfer, TokenTransferPayload};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,6 +25,8 @@ pub enum TapEnvelope {
     Mint(MintPayload),
     Transfer(TokenTransferPayload),
     Send(TokenSendPayload),
+    Trade(TokenTradePayload),
+    Auth(TokenAuthPayload),
     Control(ControlPayload),
 }
 
@@ -35,6 +39,8 @@ impl TapEnvelope {
             // token-send has per-item tickers; upstream filters by the
             // first one (must be non-empty; parser guarantees it).
             Self::Send(s) => s.first_ticker().map(|t| t.as_str()).unwrap_or(""),
+            Self::Trade(t) => t.ticker.as_str(),
+            Self::Auth(a) => a.ticker.as_str(),
             Self::Control(c) => c.ticker.as_str(),
         }
     }
@@ -45,6 +51,8 @@ impl TapEnvelope {
             Self::Mint(_) => TapOp::DmtMint,
             Self::Transfer(_) => TapOp::TokenTransfer,
             Self::Send(_) => TapOp::TokenSend,
+            Self::Trade(_) => TapOp::TokenTrade,
+            Self::Auth(_) => TapOp::TokenAuth,
             Self::Control(c) => match c.op {
                 crate::protocol::control::ControlOp::Block => TapOp::BlockTransferables,
                 crate::protocol::control::ControlOp::Unblock => TapOp::UnblockTransferables,
@@ -74,6 +82,8 @@ pub fn decode_tap_payload(env: &Envelope) -> Result<Option<TapEnvelope>> {
         TapOp::DmtMint => Ok(Some(TapEnvelope::Mint(parse_mint(&body)?))),
         TapOp::TokenTransfer => Ok(Some(TapEnvelope::Transfer(parse_transfer(&body)?))),
         TapOp::TokenSend => Ok(Some(TapEnvelope::Send(parse_send(&body)?))),
+        TapOp::TokenTrade => Ok(Some(TapEnvelope::Trade(parse_trade(&body)?))),
+        TapOp::TokenAuth => Ok(Some(TapEnvelope::Auth(parse_auth(&body)?))),
         TapOp::BlockTransferables | TapOp::UnblockTransferables => {
             Ok(Some(TapEnvelope::Control(parse_control(&body)?)))
         }

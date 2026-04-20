@@ -1,5 +1,6 @@
 pub mod address;
 pub mod amount;
+pub mod auth;
 pub mod bits;
 pub mod control;
 pub mod deploy;
@@ -9,10 +10,12 @@ pub mod mint;
 pub mod send;
 pub mod tap;
 pub mod ticker;
+pub mod trade;
 pub mod transfer;
 
 pub use address::{address_from_script, normalize_address, NormalizedAddress};
 pub use amount::parse_amount;
+pub use auth::TokenAuthPayload;
 pub use bits::{decode_bits, BitsMode};
 pub use control::{ControlOp, ControlPayload};
 pub use deploy::DeployPayload;
@@ -22,4 +25,5 @@ pub use mint::MintPayload;
 pub use send::{TokenSendItem, TokenSendPayload};
 pub use tap::TapOp;
 pub use ticker::{normalize_ticker, ticker_is_valid_at_height};
+pub use trade::TokenTradePayload;
 pub use transfer::TokenTransferPayload;

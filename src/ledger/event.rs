@@ -39,6 +39,20 @@ pub enum EventType {
     /// at tap time. Other items in the same accumulator may still have
     /// succeeded — each item is independent per TAP spec.
     TokenSendSkipped,
+    /// `token-trade` inscription observed. We parse side/tick and
+    /// persist the accumulator for diagnostic/audit visibility; the
+    /// full atomic-swap execute-path is not yet implemented, so no
+    /// balance change follows. Emitted once per inscribe.
+    TokenTradeInscribeAdmitted,
+    /// `token-trade` move seen but execute-path is unimplemented;
+    /// would have debited/credited per spec. Emitted once per move.
+    TokenTradeNotExecuted,
+    /// `token-auth` inscription observed (create-auth OR redeem).
+    /// Full execute-path requires secp256k1 signature verification;
+    /// deferred. Emitted once per inscribe.
+    TokenAuthInscribeAdmitted,
+    /// `token-auth` move seen but execute-path is unimplemented.
+    TokenAuthNotExecuted,
     BlockTransferablesInscribed,
     BlockTransferablesTapped,
     UnblockTransferablesInscribed,
@@ -65,6 +79,10 @@ impl EventType {
             Self::TokenSendDebit => "token_send_debit",
             Self::TokenSendCredit => "token_send_credit",
             Self::TokenSendSkipped => "token_send_skipped",
+            Self::TokenTradeInscribeAdmitted => "token_trade_inscribe_admitted",
+            Self::TokenTradeNotExecuted => "token_trade_not_executed",
+            Self::TokenAuthInscribeAdmitted => "token_auth_inscribe_admitted",
+            Self::TokenAuthNotExecuted => "token_auth_not_executed",
             Self::BlockTransferablesInscribed => "block_transferables_inscribed",
             Self::BlockTransferablesTapped => "block_transferables_tapped",
             Self::UnblockTransferablesInscribed => "unblock_transferables_inscribed",

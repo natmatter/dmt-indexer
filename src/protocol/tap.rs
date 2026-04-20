@@ -12,6 +12,8 @@ pub enum TapOp {
     DmtMint,
     TokenTransfer,
     TokenSend,
+    TokenTrade,
+    TokenAuth,
     BlockTransferables,
     UnblockTransferables,
 }
@@ -23,6 +25,8 @@ impl TapOp {
             "dmt-mint" => Some(Self::DmtMint),
             "token-transfer" => Some(Self::TokenTransfer),
             "token-send" => Some(Self::TokenSend),
+            "token-trade" => Some(Self::TokenTrade),
+            "token-auth" => Some(Self::TokenAuth),
             "block-transferables" => Some(Self::BlockTransferables),
             "unblock-transferables" => Some(Self::UnblockTransferables),
             _ => None,
@@ -35,6 +39,8 @@ impl TapOp {
             Self::DmtMint => "dmt-mint",
             Self::TokenTransfer => "token-transfer",
             Self::TokenSend => "token-send",
+            Self::TokenTrade => "token-trade",
+            Self::TokenAuth => "token-auth",
             Self::BlockTransferables => "block-transferables",
             Self::UnblockTransferables => "unblock-transferables",
         }
@@ -112,7 +118,8 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        // `token-send` is now supported; pick an op that really isn't.
-        assert!(decode_envelope(br#"{"p":"tap","op":"token-trade"}"#).is_err());
+        // Every TAP op we know about is enumerated; anything else is
+        // (correctly) rejected at decode time.
+        assert!(decode_envelope(br#"{"p":"tap","op":"bogus-op"}"#).is_err());
     }
 }

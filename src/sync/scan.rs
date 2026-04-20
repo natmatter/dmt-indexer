@@ -516,6 +516,8 @@ impl Syncer {
         let mut transfer_inscribe_meta: HashMap<String, TransferInscribe> = HashMap::new();
         let mut control_inscribes: Vec<ControlInscribe> = Vec::new();
         let mut send_inscribes: Vec<SendInscribe> = Vec::new();
+        let mut trade_inscribes: Vec<(String, String)> = Vec::new();
+        let mut auth_inscribes: Vec<(String, String)> = Vec::new();
         let mut fresh_carriers: Vec<(OutPoint, TrackedCarrier, Option<String>)> = Vec::new();
         let mut moves: Vec<(u32, TrackerMove)> = Vec::new();
         let mut inscription_rows: Vec<(String, InscriptionIndex)> = Vec::new();
@@ -806,6 +808,47 @@ impl Syncer {
                             },
                         ));
                     }
+                    TapEnvelope::Trade(_) => {
+                        // Recognize + record, defer balance effects.
+                        // TAP spec §token-trade atomic swap isn't
+                        // implemented yet; emitting an inscribe event
+                        // documents the skip instead of dropping silently.
+                        if deployments.get(tick_canon.as_str()).is_none() {
+                            continue;
+                        }
+                        inscription_rows.push((
+                            insc_id.clone(),
+                            InscriptionIndex {
+                                ticker: tick_canon.clone(),
+                                kind: "token-trade".to_string(),
+                                original_amount: None,
+                                inscribed_height: block.height,
+                                current_owner_address: to_addr.clone(),
+                                consumed_height: None,
+                            },
+                        ));
+                        trade_inscribes.push((insc_id, tick_canon.clone()));
+                    }
+                    TapEnvelope::Auth(_) => {
+                        // Same rationale as token-trade: recognize and
+                        // persist for audit, defer execution of the
+                        // signature-gated redeem flow.
+                        if deployments.get(tick_canon.as_str()).is_none() {
+                            continue;
+                        }
+                        inscription_rows.push((
+                            insc_id.clone(),
+                            InscriptionIndex {
+                                ticker: tick_canon.clone(),
+                                kind: "token-auth".to_string(),
+                                original_amount: None,
+                                inscribed_height: block.height,
+                                current_owner_address: to_addr.clone(),
+                                consumed_height: None,
+                            },
+                        ));
+                        auth_inscribes.push((insc_id, tick_canon.clone()));
+                    }
                     TapEnvelope::Control(cp) => {
                         let Some(_) = deployments.get(tick_canon.as_str()) else {
                             continue;
@@ -1035,6 +1078,44 @@ impl Syncer {
                     "items": s.items.len(),
                     "total_amount": s.items.iter().map(|i| i.amount).sum::<u128>(),
                 }),
+                &block_hash,
+            ));
+        }
+
+        // 2c. token-trade / token-auth inscribe events — diagnostic.
+        // Full execute-path for these ops is deferred (see
+        // protocol/{trade,auth}.rs for spec references). We emit an
+        // `inscribe_admitted` event so audit trails show the op was
+        // recognized; balances are not touched.
+        for (ins_id, tick) in trade_inscribes {
+            events.push(self.new_event(
+                &tick,
+                EventFamily::Transfer,
+                EventType::TokenTradeInscribeAdmitted,
+                block,
+                occurred_at,
+                None,
+                Some(ins_id),
+                None,
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "note": "trade execute-path not yet implemented" }),
+                &block_hash,
+            ));
+        }
+        for (ins_id, tick) in auth_inscribes {
+            events.push(self.new_event(
+                &tick,
+                EventFamily::Transfer,
+                EventType::TokenAuthInscribeAdmitted,
+                block,
+                occurred_at,
+                None,
+                Some(ins_id),
+                None,
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "note": "auth execute-path not yet implemented" }),
                 &block_hash,
             ));
         }
