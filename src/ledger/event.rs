@@ -25,6 +25,20 @@ pub enum EventType {
     TokenTransferDebit,
     TokenTransferCredit,
     TokenTransferBurned,
+    /// `token-send` inscription observed and stored as pending.
+    TokenSendInscribeAdmitted,
+    /// Parsing/validation OK but the inscribe was dropped (e.g. unknown
+    /// ticker, miner-reward shield). Emitted once at inscribe time.
+    TokenSendInscribeRejected,
+    /// One item in a tapped `token-send` moved balance: sender lost
+    /// `delta_total` of the ticker, recipient gained it. Emitted
+    /// per-item (one inscription → one event per successful item).
+    TokenSendDebit,
+    TokenSendCredit,
+    /// One item in a tapped `token-send` failed its availability check
+    /// at tap time. Other items in the same accumulator may still have
+    /// succeeded — each item is independent per TAP spec.
+    TokenSendSkipped,
     BlockTransferablesInscribed,
     BlockTransferablesTapped,
     UnblockTransferablesInscribed,
@@ -46,6 +60,11 @@ impl EventType {
             Self::TokenTransferDebit => "token_transfer_debit",
             Self::TokenTransferCredit => "token_transfer_credit",
             Self::TokenTransferBurned => "token_transfer_burned",
+            Self::TokenSendInscribeAdmitted => "token_send_inscribe_admitted",
+            Self::TokenSendInscribeRejected => "token_send_inscribe_rejected",
+            Self::TokenSendDebit => "token_send_debit",
+            Self::TokenSendCredit => "token_send_credit",
+            Self::TokenSendSkipped => "token_send_skipped",
             Self::BlockTransferablesInscribed => "block_transferables_inscribed",
             Self::BlockTransferablesTapped => "block_transferables_tapped",
             Self::UnblockTransferablesInscribed => "unblock_transferables_inscribed",

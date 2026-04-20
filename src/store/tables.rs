@@ -51,6 +51,12 @@ pub const TRANSFERABLES_BY_SENDER: TableDefinition<'static, (&str, &str, &str), 
 pub const PENDING_CONTROLS: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new("pending_controls");
 
+/// Pending token-send accumulators (pre-tap). Created at inscribe time;
+/// consumed when the inscription moves back to the creator (self-tap)
+/// to execute the per-item debit/credit batch per TAP spec §token-send.
+pub const PENDING_SENDS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("pending_sends");
+
 /// Carrier map: which outpoint currently carries which inscription.
 /// Keyed by `{txid}:{vout}`, value = JSON InscriptionOwner.
 pub const INSCRIPTION_OWNERS: TableDefinition<'static, &str, &[u8]> =
@@ -90,6 +96,7 @@ pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(MINT_CLAIMS)?;
     let _ = tx.open_table(VALID_TRANSFERS)?;
     let _ = tx.open_table(PENDING_CONTROLS)?;
+    let _ = tx.open_table(PENDING_SENDS)?;
     let _ = tx.open_table(INSCRIPTION_OWNERS)?;
     let _ = tx.open_table(DAILY_STATS)?;
     let _ = tx.open_table(ACTIVITY_RECENT)?;
@@ -142,6 +149,28 @@ pub struct PendingControl {
     pub address: String,
     pub op: String,
     pub inscribed_height: u64,
+}
+
+/// Per-item record inside a pending `token-send` accumulator. Per TAP
+/// spec, each item is validated syntactically at inscribe and executes
+/// at tap-time against the sender's current available balance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSendItem {
+    pub ticker: String,
+    pub recipient: String,
+    pub amount: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSend {
+    /// Inscriber at inscribe time; must match the owner at tap time
+    /// (self-tap rule) for the accumulator to execute.
+    pub sender: String,
+    pub inscribed_height: u64,
+    pub items: Vec<PendingSendItem>,
+    /// Set when the accumulator has been executed to avoid double-spend
+    /// on a reorg replay or tracker mis-dispatch.
+    pub consumed_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

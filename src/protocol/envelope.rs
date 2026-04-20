@@ -13,6 +13,7 @@ use crate::inscription::envelope::Envelope;
 use crate::protocol::control::{parse_control, ControlPayload};
 use crate::protocol::deploy::{parse_deploy, DeployPayload};
 use crate::protocol::mint::{parse_mint, MintPayload};
+use crate::protocol::send::{parse_send, TokenSendPayload};
 use crate::protocol::tap::{decode_envelope, TapOp};
 use crate::protocol::transfer::{parse_transfer, TokenTransferPayload};
 
@@ -21,6 +22,7 @@ pub enum TapEnvelope {
     Deploy(DeployPayload),
     Mint(MintPayload),
     Transfer(TokenTransferPayload),
+    Send(TokenSendPayload),
     Control(ControlPayload),
 }
 
@@ -30,6 +32,9 @@ impl TapEnvelope {
             Self::Deploy(d) => d.ticker.as_str(),
             Self::Mint(m) => m.ticker.as_str(),
             Self::Transfer(t) => t.ticker.as_str(),
+            // token-send has per-item tickers; upstream filters by the
+            // first one (must be non-empty; parser guarantees it).
+            Self::Send(s) => s.first_ticker().map(|t| t.as_str()).unwrap_or(""),
             Self::Control(c) => c.ticker.as_str(),
         }
     }
@@ -39,6 +44,7 @@ impl TapEnvelope {
             Self::Deploy(_) => TapOp::DmtDeploy,
             Self::Mint(_) => TapOp::DmtMint,
             Self::Transfer(_) => TapOp::TokenTransfer,
+            Self::Send(_) => TapOp::TokenSend,
             Self::Control(c) => match c.op {
                 crate::protocol::control::ControlOp::Block => TapOp::BlockTransferables,
                 crate::protocol::control::ControlOp::Unblock => TapOp::UnblockTransferables,
@@ -67,6 +73,7 @@ pub fn decode_tap_payload(env: &Envelope) -> Result<Option<TapEnvelope>> {
         TapOp::DmtDeploy => Ok(Some(TapEnvelope::Deploy(parse_deploy(&body)?))),
         TapOp::DmtMint => Ok(Some(TapEnvelope::Mint(parse_mint(&body)?))),
         TapOp::TokenTransfer => Ok(Some(TapEnvelope::Transfer(parse_transfer(&body)?))),
+        TapOp::TokenSend => Ok(Some(TapEnvelope::Send(parse_send(&body)?))),
         TapOp::BlockTransferables | TapOp::UnblockTransferables => {
             Ok(Some(TapEnvelope::Control(parse_control(&body)?)))
         }

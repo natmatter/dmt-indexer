@@ -36,6 +36,11 @@ pub struct TrackedInscription {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 pub enum InscriptionKind {
     TokenTransfer,
+    /// TAP `token-send` inscription. Stores a pending accumulator at
+    /// inscribe time; on a self-tap (move back to the creator) each
+    /// item executes as a (debit sender, credit recipient) pair per
+    /// TAP spec §token-send.
+    TokenSend,
     Control,
     /// `dmt-mint` inscriptions. Tracked only so we can keep
     /// `INSCRIPTIONS.current_owner_address` fresh as the UNAT moves;

@@ -92,6 +92,16 @@ struct ControlInscribe {
     op: ControlOp,
 }
 
+struct SendInscribe {
+    inscription_id: String,
+    /// Envelope-level ticker label (the first kept item's canonical ticker).
+    envelope_ticker: String,
+    /// Inscriber — must match the new owner at tap time for execution.
+    sender: String,
+    items: Vec<crate::store::tables::PendingSendItem>,
+    tx_index: u32,
+}
+
 impl Syncer {
     pub fn new(cfg: Config, store: Store, rpc: RpcClient, bus: EventBus) -> Self {
         Self {
@@ -505,6 +515,7 @@ impl Syncer {
         let mut transfer_inscribes_unresolved: Vec<TransferInscribeCandidate> = Vec::new();
         let mut transfer_inscribe_meta: HashMap<String, TransferInscribe> = HashMap::new();
         let mut control_inscribes: Vec<ControlInscribe> = Vec::new();
+        let mut send_inscribes: Vec<SendInscribe> = Vec::new();
         let mut fresh_carriers: Vec<(OutPoint, TrackedCarrier, Option<String>)> = Vec::new();
         let mut moves: Vec<(u32, TrackerMove)> = Vec::new();
         let mut inscription_rows: Vec<(String, InscriptionIndex)> = Vec::new();
@@ -714,6 +725,87 @@ impl Syncer {
                             },
                         ));
                     }
+                    TapEnvelope::Send(sp) => {
+                        // token-send admits any inscription whose item
+                        // set contains at least one item for our indexed
+                        // ticker. Items for other tickers are ignored
+                        // here — they only matter to indexers that track
+                        // those tickers. The accumulator still executes
+                        // on self-tap for the items we kept.
+                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
+                            continue;
+                        };
+                        let mut kept_items: Vec<crate::store::tables::PendingSendItem> = Vec::new();
+                        for it in &sp.items {
+                            if !is_indexed_ticker(it.ticker.as_str()) {
+                                continue;
+                            }
+                            // tick_canon is already the stripped form
+                            // (e.g. "nat"). We accept both "nat" and
+                            // "dmt-nat" on the wire; store the canonical
+                            // form downstream.
+                            let canon = canonical_ticker(it.ticker.as_str());
+                            if deployments.get(canon.as_str()).is_none() {
+                                continue;
+                            }
+                            kept_items.push(crate::store::tables::PendingSendItem {
+                                ticker: canon,
+                                recipient: it.address.as_str().to_string(),
+                                amount: it.amount,
+                            });
+                        }
+                        if kept_items.is_empty() {
+                            continue;
+                        }
+                        let reveal_value = txv
+                            .tx
+                            .output
+                            .get(landing_vout)
+                            .map(|o| o.value.to_sat())
+                            .unwrap_or(0);
+                        // Use the FIRST kept item's ticker as the
+                        // envelope-level ticker for the tracker/index
+                        // record. All multi-ticker sends still settle
+                        // per-item correctly; we just need a single
+                        // ticker label for the carrier metadata.
+                        let envelope_ticker = kept_items[0].ticker.clone();
+                        fresh_carriers.push((
+                            OutPoint {
+                                txid: txv.txid,
+                                vout: landing_vout as u32,
+                            },
+                            TrackedCarrier {
+                                inscription: TrackedInscription {
+                                    inscription_id: insc_id.clone(),
+                                    ticker: envelope_ticker.clone(),
+                                    kind: InscriptionKind::TokenSend,
+                                },
+                                offset_in_outpoint: 0,
+                                outpoint_value_sats: reveal_value,
+                            },
+                            to_addr.clone(),
+                        ));
+                        send_inscribes.push(SendInscribe {
+                            inscription_id: insc_id.clone(),
+                            envelope_ticker: envelope_ticker.clone(),
+                            sender: addr.as_str().to_string(),
+                            items: kept_items.clone(),
+                            tx_index,
+                        });
+                        inscription_rows.push((
+                            insc_id,
+                            InscriptionIndex {
+                                ticker: envelope_ticker,
+                                kind: "token-send".to_string(),
+                                original_amount: Some(
+                                    kept_items.iter().map(|i| i.amount).sum::<u128>(),
+                                ),
+                                inscribed_height: block.height,
+                                current_owner_address: to_addr.clone(),
+                                consumed_height: None,
+                            },
+                        ));
+                    }
                     TapEnvelope::Control(cp) => {
                         let Some(_) = deployments.get(tick_canon.as_str()) else {
                             continue;
@@ -911,6 +1003,40 @@ impl Syncer {
                     ));
                 }
             }
+        }
+
+        // 2b. token-send inscribes — persist pending accumulator per
+        // inscription, emit a diagnostic event. Balance effects are
+        // deferred until the inscription is self-tapped (moved back to
+        // the creator) and `execute_send` fires in step 6.
+        for s in send_inscribes {
+            {
+                let mut table = wtx.open_table(crate::store::tables::PENDING_SENDS)?;
+                let v = crate::store::tables::PendingSend {
+                    sender: s.sender.clone(),
+                    inscribed_height: block.height,
+                    items: s.items.clone(),
+                    consumed_height: None,
+                };
+                table.insert(s.inscription_id.as_str(), encode(&v)?.as_slice())?;
+            }
+            events.push(self.new_event(
+                &s.envelope_ticker,
+                EventFamily::Transfer,
+                EventType::TokenSendInscribeAdmitted,
+                block,
+                occurred_at,
+                Some(s.tx_index),
+                Some(s.inscription_id.clone()),
+                Some(s.sender.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({
+                    "items": s.items.len(),
+                    "total_amount": s.items.iter().map(|i| i.amount).sum::<u128>(),
+                }),
+                &block_hash,
+            ));
         }
 
         // 3. Control inscribes
@@ -1122,6 +1248,17 @@ impl Syncer {
                             self.settle_transfer(
                                 &wtx,
                                 &inscription.ticker,
+                                &inscription.inscription_id,
+                                new_owner_address.as_deref(),
+                                block,
+                                occurred_at,
+                                &block_hash,
+                                &mut events,
+                            )?;
+                        }
+                        InscriptionKind::TokenSend => {
+                            self.execute_send(
+                                &wtx,
                                 &inscription.inscription_id,
                                 new_owner_address.as_deref(),
                                 block,
@@ -1406,6 +1543,7 @@ impl Syncer {
                         ticker: owner.ticker.clone(),
                         kind: match owner.kind.as_str() {
                             "token-transfer" => InscriptionKind::TokenTransfer,
+                            "token-send" => InscriptionKind::TokenSend,
                             "control" => InscriptionKind::Control,
                             "dmt-mint" => InscriptionKind::Mint,
                             _ => InscriptionKind::Control,
@@ -1478,6 +1616,7 @@ impl Syncer {
                 ticker: carrier.inscription.ticker.clone(),
                 kind: match carrier.inscription.kind {
                     InscriptionKind::TokenTransfer => "token-transfer".to_string(),
+                    InscriptionKind::TokenSend => "token-send".to_string(),
                     InscriptionKind::Control => "control".to_string(),
                     InscriptionKind::Mint => "dmt-mint".to_string(),
                 },
@@ -1656,6 +1795,176 @@ impl Syncer {
             serde_json::json!({ "amount": amount }),
             block_hash,
         ));
+        Ok(())
+    }
+
+    /// Execute a pending `token-send` accumulator on self-tap. Per TAP
+    /// spec §token-send: the inscription must move back to its creator
+    /// (`sender == new_owner`) to trigger execution. On any other
+    /// destination we no-op and leave the accumulator in place (a later
+    /// self-tap can still fire it). On burn/ unaddressable move, we
+    /// also no-op — the accumulator eventually becomes unreachable but
+    /// doesn't affect any balance until it actually tapes.
+    ///
+    /// Within the accumulator, items are independent: one item's
+    /// insufficient-available failure does not poison the others. This
+    /// matches tap-writer / ord-tap semantics.
+    fn execute_send(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        inscription_id: &str,
+        new_owner: Option<&str>,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        // Look up the accumulator. Absent → nothing to do; a duplicate
+        // / stale move gets safely ignored.
+        let mut pending: crate::store::tables::PendingSend = {
+            let table = wtx.open_table(crate::store::tables::PENDING_SENDS)?;
+            let Some(raw) = table.get(inscription_id)? else {
+                return Ok(());
+            };
+            let Ok(v) = decode::<crate::store::tables::PendingSend>(raw.value()) else {
+                return Ok(());
+            };
+            v
+        };
+        if pending.consumed_height.is_some() {
+            return Ok(());
+        }
+        // Self-tap rule: only the creator can trigger execution. Any
+        // other move leaves the accumulator untouched — subsequent
+        // self-tap can still fire it.
+        let Some(new_owner_addr) = new_owner else {
+            return Ok(());
+        };
+        if new_owner_addr != pending.sender {
+            return Ok(());
+        }
+
+        let sender = pending.sender.clone();
+        // Process items. Each is gated independently on
+        // `available >= amount` (spec: "Each send item must exclusively
+        // operate on available balances, not overall balances").
+        for item in &pending.items {
+            let avail: i128 = {
+                let table = wtx.open_table(WALLET_STATE)?;
+                let raw = table.get((item.ticker.as_str(), sender.as_str()))?;
+                raw.and_then(|v| decode::<WalletState>(v.value()).ok())
+                    .map(|s| s.available)
+                    .unwrap_or(0)
+            };
+            let wanted = i128::try_from(item.amount).unwrap_or(i128::MAX);
+            if avail < wanted {
+                events.push(self.new_event(
+                    &item.ticker,
+                    EventFamily::Transfer,
+                    EventType::TokenSendSkipped,
+                    block,
+                    occurred_at,
+                    None,
+                    Some(inscription_id.to_string()),
+                    Some(sender.clone()),
+                    Some(item.recipient.clone()),
+                    EventDelta::default(),
+                    serde_json::json!({
+                        "amount": item.amount,
+                        "available": avail,
+                        "reason": "insufficient_available",
+                    }),
+                    block_hash,
+                ));
+                continue;
+            }
+            // Self-send item to same address: net zero per wallet state
+            // (spec treats it as a no-op so we don't move balance out
+            // and back in). Still emit both events for an audit trail.
+            if item.recipient == sender {
+                events.push(self.new_event(
+                    &item.ticker,
+                    EventFamily::Transfer,
+                    EventType::TokenSendDebit,
+                    block,
+                    occurred_at,
+                    None,
+                    Some(inscription_id.to_string()),
+                    Some(sender.clone()),
+                    Some(item.recipient.clone()),
+                    EventDelta::default(),
+                    serde_json::json!({ "amount": item.amount, "self_send": true }),
+                    block_hash,
+                ));
+                events.push(self.new_event(
+                    &item.ticker,
+                    EventFamily::Transfer,
+                    EventType::TokenSendCredit,
+                    block,
+                    occurred_at,
+                    None,
+                    Some(inscription_id.to_string()),
+                    Some(item.recipient.clone()),
+                    Some(sender.clone()),
+                    EventDelta::default(),
+                    serde_json::json!({ "amount": item.amount, "self_send": true }),
+                    block_hash,
+                ));
+                continue;
+            }
+            let a = wanted;
+            // Debit sender: total -a, available -a (unlike transfer's
+            // settle, token-send never stages amounts in the
+            // `transferable` pool — the spec debits directly from
+            // `available`).
+            apply_wallet_delta(wtx, &item.ticker, &sender, -a, -a, 0, 0, occurred_at)?;
+            events.push(self.new_event(
+                &item.ticker,
+                EventFamily::Transfer,
+                EventType::TokenSendDebit,
+                block,
+                occurred_at,
+                None,
+                Some(inscription_id.to_string()),
+                Some(sender.clone()),
+                Some(item.recipient.clone()),
+                EventDelta {
+                    delta_total: -a,
+                    delta_available: -a,
+                    ..Default::default()
+                },
+                serde_json::json!({ "amount": item.amount }),
+                block_hash,
+            ));
+            // Credit recipient
+            apply_wallet_delta(wtx, &item.ticker, &item.recipient, a, a, 0, 0, occurred_at)?;
+            events.push(self.new_event(
+                &item.ticker,
+                EventFamily::Transfer,
+                EventType::TokenSendCredit,
+                block,
+                occurred_at,
+                None,
+                Some(inscription_id.to_string()),
+                Some(item.recipient.clone()),
+                Some(sender.clone()),
+                EventDelta {
+                    delta_total: a,
+                    delta_available: a,
+                    ..Default::default()
+                },
+                serde_json::json!({ "amount": item.amount }),
+                block_hash,
+            ));
+        }
+
+        // Mark the accumulator consumed to prevent double-execution
+        // on reorg-rescan or duplicate tracker dispatch.
+        pending.consumed_height = Some(block.height);
+        {
+            let mut table = wtx.open_table(crate::store::tables::PENDING_SENDS)?;
+            table.insert(inscription_id, encode(&pending)?.as_slice())?;
+        }
         Ok(())
     }
 

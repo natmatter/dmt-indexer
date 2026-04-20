@@ -11,6 +11,7 @@ pub enum TapOp {
     DmtDeploy,
     DmtMint,
     TokenTransfer,
+    TokenSend,
     BlockTransferables,
     UnblockTransferables,
 }
@@ -21,6 +22,7 @@ impl TapOp {
             "dmt-deploy" => Some(Self::DmtDeploy),
             "dmt-mint" => Some(Self::DmtMint),
             "token-transfer" => Some(Self::TokenTransfer),
+            "token-send" => Some(Self::TokenSend),
             "block-transferables" => Some(Self::BlockTransferables),
             "unblock-transferables" => Some(Self::UnblockTransferables),
             _ => None,
@@ -32,6 +34,7 @@ impl TapOp {
             Self::DmtDeploy => "dmt-deploy",
             Self::DmtMint => "dmt-mint",
             Self::TokenTransfer => "token-transfer",
+            Self::TokenSend => "token-send",
             Self::BlockTransferables => "block-transferables",
             Self::UnblockTransferables => "unblock-transferables",
         }
@@ -109,6 +112,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        assert!(decode_envelope(br#"{"p":"tap","op":"token-send"}"#).is_err());
+        // `token-send` is now supported; pick an op that really isn't.
+        assert!(decode_envelope(br#"{"p":"tap","op":"token-trade"}"#).is_err());
     }
 }
