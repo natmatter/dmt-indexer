@@ -1776,7 +1776,12 @@ fn is_indexed_ticker(ticker: &str) -> bool {
 /// both forms map to the same deployment ticker. Lowercased since TAP
 /// matches case-insensitively.
 fn canonical_ticker(raw: &str) -> String {
-    let lower = raw.trim().to_ascii_lowercase();
+    // Do NOT trim. ord-tap matches the raw tick string literally, so
+    // " dmt-nat" (with leading space) must NOT fold onto "nat". See
+    // protocol/ticker.rs for the canonical parser that rejects whitespace
+    // outright; this function handles callers that already hold a raw
+    // or normalized string and just need case + prefix collapsing.
+    let lower = raw.to_ascii_lowercase();
     lower
         .strip_prefix("dmt-")
         .map(str::to_string)

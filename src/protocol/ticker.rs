@@ -40,18 +40,25 @@ impl std::fmt::Display for NormalizedTicker {
 /// Case-fold to lowercase and reject obviously-malformed tickers. The
 /// height-conditional length rule is applied separately by
 /// [`ticker_is_valid_at_height`].
+//
+// Do NOT trim whitespace. ord-tap preserves the raw tick string and
+// looks up the deploy record under the literal (lowercased) value, so
+// `" DMT-NAT"` (leading space) fails the lookup and is silently
+// dropped. Earlier revisions called `raw.trim()` first, which folded
+// whitespace-padded tickers onto their canonical form and over-admitted
+// inscriptions ord-tap rejects — caused the bc1pfwnrd7w −49B cascade
+// and the bc1p5q6t9gj −1.57B short.
 pub fn normalize_ticker(raw: &str) -> Result<NormalizedTicker> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if raw.is_empty() {
         return Err(Error::Protocol("ticker empty".into()));
     }
-    let char_count = trimmed.chars().count();
+    let char_count = raw.chars().count();
     if char_count > 32 {
         return Err(Error::Protocol(format!(
             "ticker too long ({char_count} chars, max 32)"
         )));
     }
-    if trimmed
+    if raw
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || c == '"')
     {
@@ -59,7 +66,7 @@ pub fn normalize_ticker(raw: &str) -> Result<NormalizedTicker> {
             "ticker has whitespace / control / quote chars".into(),
         ));
     }
-    Ok(NormalizedTicker(trimmed.to_lowercase()))
+    Ok(NormalizedTicker(raw.to_lowercase()))
 }
 
 /// Height-conditional length rule. Returns `true` if the ticker is
@@ -117,5 +124,22 @@ mod tests {
     #[test]
     fn rejects_too_long() {
         assert!(normalize_ticker(&"a".repeat(33)).is_err());
+    }
+
+    // Regression: ord-tap does not trim, so " DMT-NAT" and "dmt-nat"
+    // are distinct tickers. We must reject, not silently fold onto nat.
+    #[test]
+    fn rejects_leading_whitespace() {
+        assert!(normalize_ticker(" DMT-NAT").is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_whitespace() {
+        assert!(normalize_ticker("nat ").is_err());
+    }
+
+    #[test]
+    fn rejects_tab() {
+        assert!(normalize_ticker("\tnat").is_err());
     }
 }
