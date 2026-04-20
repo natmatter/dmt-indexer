@@ -669,21 +669,26 @@
     return { data, total };
   }
 
-  // ------------- routing (hash-based) -------------
+  // ------------- routing (path-based, via history API) -------------
+  // URLs look like /w/<addr> — no hash. The Rust router serves index.html
+  // for /w/<addr> so direct loads and reloads still work.
   function currentAddress() {
-    const h = location.hash || "";
-    const m = h.match(/^#\/?w\/([^/?#]+)/);
+    const m = location.pathname.match(/^\/w\/([^/?#]+)/);
     return m ? decodeURIComponent(m[1]) : null;
   }
   function navTo(address) {
-    location.hash = "#/w/" + encodeURIComponent(address);
+    const next = "/w/" + encodeURIComponent(address);
+    if (location.pathname !== next) {
+      history.pushState(null, "", next);
+    }
+    handleRoute();
   }
 
   // Clickable address anywhere → navigate
   function addrLink(address) {
     if (!address) return '<span class="none">—</span>';
     const safe = String(address).replace(/"/g, "");
-    return `<a href="#/w/${encodeURIComponent(safe)}" title="${safe}">${shorten(safe, 10, 8)}</a>`;
+    return `<a href="/w/${encodeURIComponent(safe)}" title="${safe}">${shorten(safe, 10, 8)}</a>`;
   }
 
   // ------------- activity rendering -------------
@@ -771,7 +776,7 @@
   function whoCells(ev) {
     const addr = (a) => !a
       ? `<span class="none">—</span>`
-      : `<a href="#/w/${encodeURIComponent(a)}" title="${a}">${shorten(a, 8, 6)}</a>`;
+      : `<a href="/w/${encodeURIComponent(a)}" title="${a}">${shorten(a, 8, 6)}</a>`;
     const { from, to } = fromTo(ev);
     return `<span class="from">${addr(from)}</span><span class="to">${addr(to)}</span>`;
   }
@@ -968,7 +973,7 @@
           const share = supply > 0 ? (Number(r.total) / supply) * 100 : 0;
           return `<tr>
             <td class="rank">${String(startRank + i + 1).padStart(2, "0")}</td>
-            <td class="addr"><a href="#/w/${encodeURIComponent(r.address)}">${shorten(r.address, 12, 10)}</a></td>
+            <td class="addr"><a href="/w/${encodeURIComponent(r.address)}">${shorten(r.address, 12, 10)}</a></td>
             <td class="share">
               <div style="display:flex; justify-content:space-between;"><span>${share.toFixed(3)}%</span></div>
               <div class="bar"><i style="width:${Math.min(100, share * 4).toFixed(2)}%"></i></div>
@@ -1114,17 +1119,33 @@
     if (e.key === "Enter") { e.preventDefault(); go(); }
   });
 
-  // Brand link = go home (clear hash, keep history clean)
+  // Brand link = go home
   document.getElementById("brandHome").addEventListener("click", (e) => {
     e.preventDefault();
-    if (location.hash) {
-      history.pushState("", document.title, location.pathname + location.search);
+    if (location.pathname !== "/") {
+      history.pushState(null, "", "/");
       handleRoute();
     }
     window.scrollTo({ top: 0, behavior: "smooth" });
   });
 
-  // React to hash changes (forward/back, internal links)
+  // Intercept internal <a href="/..."> clicks for SPA navigation. Leaves
+  // modifier-clicks and external targets alone so "open in new tab" works.
+  document.addEventListener("click", (e) => {
+    if (e.defaultPrevented) return;
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest("a[href]");
+    if (!a) return;
+    if (a.target && a.target !== "_self") return;
+    const href = a.getAttribute("href");
+    if (!href || !href.startsWith("/")) return;
+    e.preventDefault();
+    if (href !== location.pathname + location.search) {
+      history.pushState(null, "", href);
+    }
+    handleRoute();
+  });
+
   function handleRoute() {
     const addr = currentAddress();
     if (addr) {
@@ -1136,7 +1157,13 @@
       $("addr").value = "";
     }
   }
-  window.addEventListener("hashchange", handleRoute);
+  window.addEventListener("popstate", handleRoute);
+
+  // Migrate legacy hash routes (/#/w/<addr>) to path routes on first load.
+  if (location.hash.startsWith("#/")) {
+    const legacy = location.hash.slice(1);
+    history.replaceState(null, "", legacy);
+  }
 
   // Filter pill clicks: reset + reload with server-side filter
   wireFilters("feedFilters", "feed", loadFeedReset);

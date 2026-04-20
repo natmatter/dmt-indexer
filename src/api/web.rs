@@ -15,6 +15,9 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
+        // SPA fallback: path-based client routing needs the server to return
+        // the same HTML for every wallet URL so reloads and direct loads work.
+        .route("/w/{address}", get(index))
 }
 
 async fn index() -> Response {
