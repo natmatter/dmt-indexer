@@ -416,6 +416,16 @@
     flex-wrap: wrap; gap: 12px;
   }
   footer a:hover { color: var(--accent); }
+  footer .disclaim {
+    flex-basis: 100%;
+    margin: 10px 0 0;
+    font-size: 10px;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--dim-2);
+    max-width: 720px;
+    line-height: 1.55;
+  }
 
   /* Loading */
   .skel {
@@ -619,6 +629,9 @@
   <footer>
     <div>NAT explorer · read-only</div>
     <div><a href="https://digital-matter-theory.gitbook.io/digital-matter-theory" target="_blank" rel="noopener">Digital Matter Theory ↗</a></div>
+    <p class="disclaim">
+      Data is indexed from the Bitcoin blockchain and provided as-is, without warranty. Nothing here is financial advice. Balances may lag the chain tip or change briefly during reorgs.
+    </p>
   </footer>
 </div>
 
