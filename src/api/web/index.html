@@ -289,7 +289,6 @@
   }
   .list .from a:hover, .list .to a:hover { border-bottom-color: var(--accent); color: var(--accent); }
   .list .none { color: var(--dim-2); }
-  .list .self-you { color: var(--accent); }
   .list .amt { font-variant-numeric: tabular-nums; }
   .list .amt.in  { color: var(--credit); }
   .list .amt.out { color: var(--debit); }
@@ -769,13 +768,10 @@
   }
 
   // Render from + to as two direct grid children. Nulls become "—".
-  function whoCells(ev, selfAddr = null) {
-    const isSelf = (a) => selfAddr && a && a.toLowerCase() === selfAddr.toLowerCase();
+  function whoCells(ev) {
     const addr = (a) => !a
       ? `<span class="none">—</span>`
-      : (isSelf(a)
-          ? `<span class="self-you" title="${a}">you</span>`
-          : `<a href="#/w/${encodeURIComponent(a)}" title="${a}">${shorten(a, 8, 6)}</a>`);
+      : `<a href="#/w/${encodeURIComponent(a)}" title="${a}">${shorten(a, 8, 6)}</a>`;
     const { from, to } = fromTo(ev);
     return `<span class="from">${addr(from)}</span><span class="to">${addr(to)}</span>`;
   }
@@ -793,7 +789,7 @@
   }
 
   function renderRow(ev, opts = {}) {
-    const { selfAddr = null, scope = "wallet" } = opts;
+    const { scope = "wallet" } = opts;
     const k = classify(ev, scope);
     const amt = Number(ev.metadata?.amount ?? Math.abs(ev.delta?.delta_total ?? 0));
     const sign = k.dir === "out" ? "−" : (k.dir === "in" ? "+" : "");
@@ -807,7 +803,7 @@
     return `<li>
       <span class="blk">${fmt(ev.block_height)}</span>
       <span class="tag ${k.cls}" title="${k.hint}">${k.tag}</span>
-      ${whoCells(ev, selfAddr)}
+      ${whoCells(ev)}
       <span class="amt ${k.cls}">${amtStr}</span>
       <span class="t">${timeCell}</span>
     </li>`;
@@ -863,7 +859,7 @@
   function renderWalletActivity() {
     const { events, filter, loading, address } = state.wallet;
     $("walletActivity").innerHTML = events.length
-      ? events.map(ev => renderRow(ev, { selfAddr: address, scope: "wallet" })).join("")
+      ? events.map(ev => renderRow(ev, { scope: "wallet" })).join("")
       : (loading ? `<li class="empty">Loading…</li>` : `<li class="empty">No ${filter === "all" ? "" : filter + " "}activity for this wallet.</li>`);
     $("walletActCount").textContent = state.wallet.total
       ? `${fmt(state.wallet.total)} total`
