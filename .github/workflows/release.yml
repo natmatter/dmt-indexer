@@ -42,6 +42,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Belt-and-braces. The `targets:` input above should suffice, but
+      # macos-latest runners (aarch64) have been flaky about installing
+      # x86_64-apple-darwin's std on the first run.
+      - name: Ensure target toolchain is installed
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
