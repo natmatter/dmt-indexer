@@ -47,11 +47,15 @@ pub fn decode_envelope(payload: &[u8]) -> Result<(TapOp, Map<String, Value>)> {
         Value::Object(m) => m,
         _ => return Err(Error::Protocol("tap payload must be JSON object".into())),
     };
-    let protocol = take_string(&mut object, "p")?;
+    // `p` and `op` are case-insensitive per ord-tap — both fields are
+    // lowercased before comparison. A payload with `"P":"TAP"` or
+    // `"op":"DMT-Mint"` is admitted by ord-tap; v2 previously required
+    // exact case and would silently drop such inscriptions.
+    let protocol = take_string(&mut object, "p")?.to_ascii_lowercase();
     if protocol != PROTOCOL_TAP {
         return Err(Error::Protocol(format!("not TAP protocol: {protocol:?}")));
     }
-    let op_str = take_string(&mut object, "op")?;
+    let op_str = take_string(&mut object, "op")?.to_ascii_lowercase();
     let op = TapOp::parse(&op_str)
         .ok_or_else(|| Error::Protocol(format!("unsupported op: {op_str}")))?;
     Ok((op, object))

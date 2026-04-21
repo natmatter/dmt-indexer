@@ -198,7 +198,19 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
     // safe because the tracker is rebuilt from INSCRIPTION_OWNERS on
     // every tick.
     //
-    // 2. Truncate wallet_state + balances_by_value.
+    // 2. Truncate wallet_state + balances_by_value + dmt_reward_addresses.
+    // All three are replay-derived; event stream is authoritative.
+    {
+        let mut m = tx.open_table(crate::store::tables::DMT_REWARD_ADDRESSES)?;
+        let keys: Vec<String> = m
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for a in keys {
+            m.remove(a.as_str())?;
+        }
+    }
     {
         let mut ws = tx.open_table(WALLET_STATE)?;
         let keys: Vec<(String, String)> = ws
@@ -366,6 +378,24 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
                     encode(&state)?.as_slice(),
                 )?;
                 touched.insert(key, prev_total);
+
+                // Re-mark DMT-reward addresses. Any CoinbaseRewardCredit
+                // or CoinbaseRewardLocked at height >= the miner-transfer
+                // activation height counted as a reward credit in the
+                // forward path and must therefore re-seed the permanent
+                // marker. Idempotent.
+                if matches!(
+                    ev.event_type,
+                    crate::ledger::event::EventType::CoinbaseRewardCredit
+                        | crate::ledger::event::EventType::CoinbaseRewardLocked
+                ) && ev.block_height
+                    >= crate::ledger::deploy::NAT_MINER_TRANSFER_ACTIVATION
+                {
+                    let mut m = tx.open_table(crate::store::tables::DMT_REWARD_ADDRESSES)?;
+                    if m.get(addr.as_str())?.is_none() {
+                        m.insert(addr.as_str(), 1u8)?;
+                    }
+                }
             }
             // Rebuild daily_stats + daily_active_addresses from this event.
             let day = (ev.occurred_at.timestamp() / 86400) as u32;

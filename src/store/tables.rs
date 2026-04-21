@@ -51,6 +51,17 @@ pub const TRANSFERABLES_BY_SENDER: TableDefinition<'static, (&str, &str, &str), 
 pub const PENDING_CONTROLS: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new("pending_controls");
 
+/// Addresses that have ever received a DMT coinbase reward credit at or
+/// after the miner-reward-shield activation height. Permanent marker —
+/// set once on first post-activation credit and never removed, even if
+/// the owner later inscribes `unblock-transferables`. Used by the
+/// transfer-execution shield (height >= 942,002) to void outstanding
+/// transfers from miners who slipped past the create-time bltr check
+/// by unblocking after inscribing. Mirrors ord-tap's `dmtrwd/<addr>`.
+/// Value byte is unused; presence of the key is the signal.
+pub const DMT_REWARD_ADDRESSES: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("dmt_reward_addresses");
+
 /// Carrier map: which outpoint currently carries which inscription.
 /// Keyed by `{txid}:{vout}`, value = JSON InscriptionOwner.
 pub const INSCRIPTION_OWNERS: TableDefinition<'static, &str, &[u8]> =

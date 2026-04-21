@@ -25,6 +25,13 @@ pub enum EventType {
     TokenTransferDebit,
     TokenTransferCredit,
     TokenTransferBurned,
+    /// At height >= 942,002, a token-transfer tap whose original
+    /// inscriber is a DMT-reward address is voided: sender keeps the
+    /// balance (no debit), recipient gets nothing (no credit), the
+    /// transferable is released back to the sender's available pool,
+    /// and the valid_transfer row is deleted. Mirrors ord-tap's
+    /// miner-reward-transfer-execution-shield.
+    TokenTransferShieldVoided,
     BlockTransferablesInscribed,
     BlockTransferablesTapped,
     UnblockTransferablesInscribed,
@@ -46,6 +53,7 @@ impl EventType {
             Self::TokenTransferDebit => "token_transfer_debit",
             Self::TokenTransferCredit => "token_transfer_credit",
             Self::TokenTransferBurned => "token_transfer_burned",
+            Self::TokenTransferShieldVoided => "token_transfer_shield_voided",
             Self::BlockTransferablesInscribed => "block_transferables_inscribed",
             Self::BlockTransferablesTapped => "block_transferables_tapped",
             Self::UnblockTransferablesInscribed => "unblock_transferables_inscribed",

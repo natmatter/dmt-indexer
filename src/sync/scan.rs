@@ -37,9 +37,9 @@ use crate::store::codec::{decode, encode};
 use crate::store::tables::{
     self, cursor_get, cursor_set, Cursor, DailyStats, InscriptionIndex, InscriptionOwner,
     MintClaim, PendingControl as StoredPendingControl, ValidTransfer, WalletState, ACTIVITY_RECENT,
-    DAILY_STATS, DEPLOYMENTS, EVENTS, INSCRIPTIONS, INSCRIPTION_OWNERS, MINT_CLAIMS,
-    PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS, WALLET_ACTIVITY,
-    WALLET_STATE,
+    DAILY_STATS, DEPLOYMENTS, DMT_REWARD_ADDRESSES, EVENTS, INSCRIPTIONS, INSCRIPTION_OWNERS,
+    MINT_CLAIMS, PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS,
+    WALLET_ACTIVITY, WALLET_STATE,
 };
 use crate::store::Store;
 use crate::sync::reorg::{detect_reorg, rewind_cursor};
@@ -800,10 +800,20 @@ impl Syncer {
             }
         }
 
-        // Resolve transfer inscribes serially
+        // Resolve transfer inscribes serially. The blocked-senders set
+        // enforces ord-tap's create-time miner-reward-shield (any
+        // wallet whose `transferables_blocked` flag is set cannot
+        // inscribe new transferables). The flag is auto-set on the
+        // first post-941,848 coinbase credit and cleared only by an
+        // explicit `unblock-transferables` control op.
         let avail_snapshot = self.snapshot_available_from(wtx, &transfer_inscribes_unresolved)?;
-        let inscribe_resolutions =
-            resolve_transfer_inscribes(transfer_inscribes_unresolved, &avail_snapshot);
+        let blocked_senders =
+            self.snapshot_blocked_senders_from(wtx, &transfer_inscribes_unresolved)?;
+        let inscribe_resolutions = resolve_transfer_inscribes(
+            transfer_inscribes_unresolved,
+            &avail_snapshot,
+            &blocked_senders,
+        );
 
         // Resolve mints per ticker
         let mut mint_resolutions = Vec::new();
@@ -896,6 +906,7 @@ impl Syncer {
                     snapshot_available,
                     inscribed_height: _,
                     tx_index,
+                    reason,
                 } => {
                     events.push(self.new_event(
                         &ticker,
@@ -911,7 +922,7 @@ impl Syncer {
                         serde_json::json!({
                             "amount": attempted_amount,
                             "available": snapshot_available,
-                            "reason": "insufficient_available",
+                            "reason": reason,
                         }),
                         &block_hash,
                     ));
@@ -1059,19 +1070,30 @@ impl Syncer {
                     continue;
                 }
                 if let Some(addr) = share.address.clone() {
-                    let is_first_credit = wallet_is_new(&wtx, &ticker, &addr)?;
+                    // Read the current bltr flag BEFORE applying the
+                    // delta so we know whether to auto-set it. ord-tap:
+                    // bltr is auto-set on the first post-activation
+                    // reward credit if it wasn't already set; an
+                    // explicit `unblock-transferables` clears it, and
+                    // subsequent credits do NOT re-block.
+                    let was_blocked = wallet_is_blocked(&wtx, &ticker, &addr)?;
                     apply_wallet_delta(&wtx, &ticker, &addr, a, a, 0, 0, occurred_at)?;
-                    // Only set the lock flag on the wallet's FIRST
-                    // post-activation coinbase credit. This prevents a
-                    // later miner credit from re-locking a wallet the
-                    // owner has already run `unblock-transferables` on.
-                    if share.should_lock_on_first_credit && is_first_credit {
-                        set_wallet_locked(&wtx, &ticker, &addr)?;
+                    if share.should_lock_on_first_credit {
+                        // dmtrwd marker is PERMANENT — idempotent put.
+                        // Needed for the transfer-execution shield
+                        // (height >= 942,002), which invalidates
+                        // outstanding transferables from any past
+                        // miner even after they unblock themselves.
+                        dmt_reward_mark(&wtx, &addr)?;
+                        if !was_blocked {
+                            set_wallet_locked(&wtx, &ticker, &addr)?;
+                        }
                     }
+                    let did_lock_now = share.should_lock_on_first_credit && !was_blocked;
                     events.push(self.new_event(
                         &ticker,
                         EventFamily::Coinbase,
-                        if share.should_lock_on_first_credit && is_first_credit {
+                        if did_lock_now {
                             EventType::CoinbaseRewardLocked
                         } else {
                             EventType::CoinbaseRewardCredit
@@ -1463,6 +1485,33 @@ impl Syncer {
         Ok(out)
     }
 
+    /// Snapshot of `transferables_blocked` for each candidate's
+    /// `(ticker, address)`. Used by `resolve_transfer_inscribes` to
+    /// enforce ord-tap's create-time miner-reward-shield at height
+    /// >= 941,848 — a blocked sender cannot inscribe new transferables,
+    /// regardless of available balance.
+    fn snapshot_blocked_senders_from(
+        &self,
+        wtx: &redb::WriteTransaction,
+        candidates: &[TransferInscribeCandidate],
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        let table = wtx.open_table(WALLET_STATE)?;
+        let mut out = std::collections::HashSet::new();
+        for c in candidates {
+            let key = (c.ticker.clone(), c.address.as_str().to_string());
+            if out.contains(&key) {
+                continue;
+            }
+            let state: Option<WalletState> = table
+                .get((c.ticker.as_str(), c.address.as_str()))?
+                .and_then(|v| decode(v.value()).ok());
+            if state.map(|s| s.transferables_blocked).unwrap_or(false) {
+                out.insert(key);
+            }
+        }
+        Ok(out)
+    }
+
     fn save_carriers(
         &self,
         wtx: &redb::WriteTransaction,
@@ -1564,6 +1613,37 @@ impl Syncer {
             idx.remove((ticker, sender.as_str(), inscription_id))?;
         }
         let a = i128::try_from(amount).unwrap_or(i128::MAX);
+
+        // Miner-reward transfer-execution shield (height >= 942,002):
+        // if the sender is a DMT-reward address, the tap is voided.
+        // Sender keeps the balance (no total debit), the transferable
+        // is released back to available, recipient gets nothing.
+        // Mirrors ord-tap's `tap_blocks_dmt_reward_transfer_execution`.
+        if block.height >= crate::ledger::deploy::NAT_MINER_TRANSFER_EXECUTION_SHIELD
+            && is_dmt_reward_address(wtx, &sender)?
+        {
+            apply_wallet_delta(wtx, ticker, &sender, 0, a, -a, 0, occurred_at)?;
+            events.push(self.new_event(
+                ticker,
+                EventFamily::Transfer,
+                EventType::TokenTransferShieldVoided,
+                block,
+                occurred_at,
+                None,
+                Some(inscription_id.to_string()),
+                Some(sender),
+                new_owner.map(str::to_string),
+                EventDelta {
+                    delta_available: a,
+                    delta_transferable: -a,
+                    ..Default::default()
+                },
+                serde_json::json!({ "amount": amount, "reason": "dmt_reward_execution_shield" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+
         // Debit sender transferable
         apply_wallet_delta(wtx, ticker, &sender, -a, 0, -a, 0, occurred_at)?;
         events.push(self.new_event(
@@ -1919,10 +1999,38 @@ fn set_wallet_locked(wtx: &redb::WriteTransaction, ticker: &str, address: &str) 
     set_wallet_locked_flag(wtx, ticker, address, true)
 }
 
-fn wallet_is_new(wtx: &redb::WriteTransaction, ticker: &str, address: &str) -> Result<bool> {
+fn wallet_is_blocked(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    address: &str,
+) -> Result<bool> {
     let table = wtx.open_table(WALLET_STATE)?;
-    let raw = table.get((ticker, address))?;
-    Ok(raw.is_none())
+    let Some(raw) = table.get((ticker, address))? else {
+        return Ok(false);
+    };
+    let state: WalletState = match decode(raw.value()) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    Ok(state.transferables_blocked)
+}
+
+/// Record a permanent marker that `address` has received a DMT coinbase
+/// reward credit. The marker is the prerequisite signal for the
+/// miner-reward-transfer-execution shield at height >= 942,002.
+/// Mirrors ord-tap's `dmtrwd/<addr>` key.
+fn dmt_reward_mark(wtx: &redb::WriteTransaction, address: &str) -> Result<()> {
+    let mut table = wtx.open_table(DMT_REWARD_ADDRESSES)?;
+    if table.get(address)?.is_none() {
+        table.insert(address, 1u8)?;
+    }
+    Ok(())
+}
+
+fn is_dmt_reward_address(wtx: &redb::WriteTransaction, address: &str) -> Result<bool> {
+    let table = wtx.open_table(DMT_REWARD_ADDRESSES)?;
+    let found = table.get(address)?.is_some();
+    Ok(found)
 }
 
 fn set_wallet_locked_flag(

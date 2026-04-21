@@ -38,6 +38,14 @@ pub struct Deployment {
 
 pub const NAT_COINBASE_ACTIVATION: u64 = 885_588;
 pub const NAT_MINER_TRANSFER_ACTIVATION: u64 = 941_848;
+/// Second phase of the miner-reward shield. After this height, a
+/// token-transfer tap from a DMT-reward address is voided regardless
+/// of the sender's current `transferables_blocked` flag's origin —
+/// the permanent `dmt_reward_addresses` marker is the authoritative
+/// signal. The transferable is released back to available; sender
+/// keeps the balance, recipient gets nothing. Mirrors ord-tap's
+/// `MinerRewardTransferExecutionShieldActivation` (942,002).
+pub const NAT_MINER_TRANSFER_EXECUTION_SHIELD: u64 = 942_002;
 
 /// Build a [`Deployment`] from a parsed on-chain payload. Preserved
 /// for future scope expansion; the v0.1.0 sync pipeline short-circuits
