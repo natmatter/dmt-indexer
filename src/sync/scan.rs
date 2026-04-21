@@ -901,7 +901,7 @@ impl Syncer {
                             delta_transferable: a,
                             ..Default::default()
                         },
-                        serde_json::json!({ "amount": amount }),
+                        serde_json::json!({ "amount": amount.to_string() }),
                         &block_hash,
                     ));
                 }
@@ -926,9 +926,13 @@ impl Syncer {
                         Some(address.as_str().to_string()),
                         None,
                         EventDelta::default(),
+                        // u128/i128 don't round-trip through serde_json's
+                        // number type (capped at i64/u64/f64). Serialize
+                        // as decimal strings to preserve range for pathological
+                        // `amt` values that fit u128 but overflow u64.
                         serde_json::json!({
-                            "amount": attempted_amount,
-                            "available": snapshot_available,
+                            "amount": attempted_amount.to_string(),
+                            "available": snapshot_available.to_string(),
                             "reason": reason,
                         }),
                         &block_hash,
@@ -1006,7 +1010,7 @@ impl Syncer {
                         delta_available: a,
                         ..Default::default()
                     },
-                    serde_json::json!({ "blk": blk, "amount": amount }),
+                    serde_json::json!({ "blk": blk, "amount": amount.to_string() }),
                     &block_hash,
                 ));
             }
@@ -1071,7 +1075,7 @@ impl Syncer {
                         },
                         serde_json::json!({
                             "value_sats": share.value_sats,
-                            "amount": share.share_amount,
+                            "amount": share.share_amount.to_string(),
                         }),
                         &block_hash,
                     ));
@@ -1123,7 +1127,7 @@ impl Syncer {
                         },
                         serde_json::json!({
                             "value_sats": share.value_sats,
-                            "amount": share.share_amount,
+                            "amount": share.share_amount.to_string(),
                         }),
                         &block_hash,
                     ));
@@ -1650,7 +1654,7 @@ impl Syncer {
                     delta_transferable: -a,
                     ..Default::default()
                 },
-                serde_json::json!({ "amount": amount, "reason": "dmt_reward_execution_shield" }),
+                serde_json::json!({ "amount": amount.to_string(), "reason": "dmt_reward_execution_shield" }),
                 block_hash,
             ));
             return Ok(());
@@ -1673,7 +1677,7 @@ impl Syncer {
                 delta_transferable: -a,
                 ..Default::default()
             },
-            serde_json::json!({ "amount": amount }),
+            serde_json::json!({ "amount": amount.to_string() }),
             block_hash,
         ));
         // Credit recipient
@@ -1694,7 +1698,7 @@ impl Syncer {
                     delta_available: a,
                     ..Default::default()
                 },
-                serde_json::json!({ "amount": amount }),
+                serde_json::json!({ "amount": amount.to_string() }),
                 block_hash,
             ));
         }
@@ -1751,7 +1755,7 @@ impl Syncer {
                 delta_burned: a,
                 ..Default::default()
             },
-            serde_json::json!({ "amount": amount }),
+            serde_json::json!({ "amount": amount.to_string() }),
             block_hash,
         ));
         Ok(())
