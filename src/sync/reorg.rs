@@ -198,8 +198,8 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
     // safe because the tracker is rebuilt from INSCRIPTION_OWNERS on
     // every tick.
     //
-    // 2. Truncate wallet_state + balances_by_value + dmt_reward_addresses.
-    // All three are replay-derived; event stream is authoritative.
+    // 2. Truncate replay-derived tables: wallet_state, balances_by_value,
+    // dmt_reward_addresses, and mint_totals. Event stream is authoritative.
     {
         let mut m = tx.open_table(crate::store::tables::DMT_REWARD_ADDRESSES)?;
         let keys: Vec<String> = m
@@ -209,6 +209,17 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
             .collect();
         for a in keys {
             m.remove(a.as_str())?;
+        }
+    }
+    {
+        let mut m = tx.open_table(crate::store::tables::MINT_TOTALS)?;
+        let keys: Vec<String> = m
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for t in keys {
+            m.remove(t.as_str())?;
         }
     }
     {
@@ -396,6 +407,36 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
                         m.insert(addr.as_str(), 1u8)?;
                     }
                 }
+            }
+
+            // Re-accumulate the supply-cap counter. Every mint credit
+            // and non-burn coinbase credit contributes to cumulative
+            // issuance; a burned coinbase output never credits a wallet
+            // and never bumps the counter.
+            use crate::ledger::event::EventType as Et;
+            let issuance_delta: u128 = match ev.event_type {
+                Et::DmtMintCredit | Et::CoinbaseRewardCredit | Et::CoinbaseRewardLocked => {
+                    u128::try_from(ev.delta.delta_total).unwrap_or(0)
+                }
+                _ => 0,
+            };
+            if issuance_delta > 0 {
+                let mut mt = tx.open_table(crate::store::tables::MINT_TOTALS)?;
+                let current: u128 = match mt.get(ev.ticker.as_str())? {
+                    Some(raw) => {
+                        let b = raw.value();
+                        if b.len() == 16 {
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(b);
+                            u128::from_le_bytes(a)
+                        } else {
+                            0
+                        }
+                    }
+                    None => 0,
+                };
+                let next = current.saturating_add(issuance_delta);
+                mt.insert(ev.ticker.as_str(), next.to_le_bytes().as_slice())?;
             }
             // Rebuild daily_stats + daily_active_addresses from this event.
             let day = (ev.occurred_at.timestamp() / 86400) as u32;

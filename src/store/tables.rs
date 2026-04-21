@@ -62,6 +62,14 @@ pub const PENDING_CONTROLS: TableDefinition<'static, &str, &[u8]> =
 pub const DMT_REWARD_ADDRESSES: TableDefinition<'static, &str, u8> =
     TableDefinition::new("dmt_reward_addresses");
 
+/// Cumulative mint + coinbase issuance per ticker, encoded as the
+/// `u128` total in LE bytes. Incremented on every admitted mint and
+/// coinbase credit; the mint resolver clamps each candidate's amount
+/// so `cumulative + amount <= max_supply` per the deploy's `max`
+/// field. Mirrors ord-tap's `dc/<tick>` "tokens_left" counter.
+pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("mint_totals");
+
 /// Carrier map: which outpoint currently carries which inscription.
 /// Keyed by `{txid}:{vout}`, value = JSON InscriptionOwner.
 pub const INSCRIPTION_OWNERS: TableDefinition<'static, &str, &[u8]> =

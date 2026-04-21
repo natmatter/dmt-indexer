@@ -100,7 +100,7 @@ pub fn distribute(
 mod tests {
     use super::*;
     use crate::ledger::deploy::{
-        Deployment, NAT_COINBASE_ACTIVATION, NAT_MINER_TRANSFER_ACTIVATION,
+        Deployment, NAT_COINBASE_ACTIVATION, NAT_MAX_SUPPLY, NAT_MINER_TRANSFER_ACTIVATION,
     };
     use crate::protocol::bits::{decode_bits, BitsMode};
     use crate::protocol::element::ElementField;
@@ -119,6 +119,7 @@ mod tests {
             activation_height: 817_709,
             coinbase_activation: Some(NAT_COINBASE_ACTIVATION),
             miner_transfer_activation: Some(NAT_MINER_TRANSFER_ACTIVATION),
+            max_supply: NAT_MAX_SUPPLY,
             registered_at: chrono::Utc::now(),
         }
     }

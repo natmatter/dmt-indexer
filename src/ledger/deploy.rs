@@ -33,11 +33,21 @@ pub struct Deployment {
     /// Block at which new coinbase recipients start with
     /// transferability blocked (NAT: 941,848).
     pub miner_transfer_activation: Option<u64>,
+    /// Hard supply cap from the deploy `max` field. The resolver clamps
+    /// each admitted mint amount so cumulative issuance never exceeds
+    /// this — matches ord-tap's `tokens_left` tracking against the
+    /// per-deployment `dc/<tick>` counter. For NAT this is
+    /// `u64::MAX` per the on-chain deploy.
+    pub max_supply: u128,
     pub registered_at: DateTime<Utc>,
 }
 
 pub const NAT_COINBASE_ACTIVATION: u64 = 885_588;
 pub const NAT_MINER_TRANSFER_ACTIVATION: u64 = 941_848;
+/// NAT's hard supply cap from the deploy inscription (`max` field).
+/// `2^64 - 1` is effectively unbounded given realistic issuance rates,
+/// but we still clamp against it to match ord-tap exactly.
+pub const NAT_MAX_SUPPLY: u128 = u64::MAX as u128;
 /// Second phase of the miner-reward shield. After this height, a
 /// token-transfer tap from a DMT-reward address is voided regardless
 /// of the sender's current `transferables_blocked` flag's origin —
@@ -83,6 +93,11 @@ pub fn register(
     } else {
         (None, None)
     };
+    let max_supply = if payload.ticker.as_str() == "nat" {
+        NAT_MAX_SUPPLY
+    } else {
+        u128::MAX
+    };
     Ok(Deployment {
         ticker: payload.ticker,
         deploy_inscription_id,
@@ -94,6 +109,7 @@ pub fn register(
         activation_height: inscribed_height,
         coinbase_activation,
         miner_transfer_activation,
+        max_supply,
         registered_at: Utc::now(),
     })
 }

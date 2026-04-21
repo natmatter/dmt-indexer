@@ -38,7 +38,7 @@ use crate::store::tables::{
     self, cursor_get, cursor_set, Cursor, DailyStats, InscriptionIndex, InscriptionOwner,
     MintClaim, PendingControl as StoredPendingControl, ValidTransfer, WalletState, ACTIVITY_RECENT,
     DAILY_STATS, DEPLOYMENTS, DMT_REWARD_ADDRESSES, EVENTS, INSCRIPTIONS, INSCRIPTION_OWNERS,
-    MINT_CLAIMS, PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS,
+    MINT_CLAIMS, MINT_TOTALS, PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS,
     WALLET_ACTIVITY, WALLET_STATE,
 };
 use crate::store::Store;
@@ -186,6 +186,7 @@ impl Syncer {
             activation_height: 817_709,
             coinbase_activation: Some(NAT_COINBASE_ACTIVATION),
             miner_transfer_activation: Some(NAT_MINER_TRANSFER_ACTIVATION),
+            max_supply: crate::ledger::deploy::NAT_MAX_SUPPLY,
             registered_at: Utc::now(),
         }];
         let wtx = self.store.write()?;
@@ -815,14 +816,20 @@ impl Syncer {
             &blocked_senders,
         );
 
-        // Resolve mints per ticker
+        // Resolve mints per ticker, threading the cumulative-issued
+        // total so the resolver can clamp against `max_supply` and
+        // match ord-tap's `dc/<tick>` tokens-left bookkeeping.
         let mut mint_resolutions = Vec::new();
         for (ticker, cands) in mint_cands {
             let Some(dep) = deployments.get(&ticker) else {
                 continue;
             };
             let claimed = self.load_claimed_blocks_from(wtx, &ticker)?;
-            mint_resolutions.push((ticker, resolve_mints(dep, block.height, &claimed, cands)));
+            let cumulative = read_mint_total(wtx, &ticker)?;
+            mint_resolutions.push((
+                ticker,
+                resolve_mints(dep, block.height, &claimed, cands, cumulative),
+            ));
         }
 
         // Coinbase distribution
@@ -983,6 +990,7 @@ impl Syncer {
                 }
                 let a = i128::try_from(amount).unwrap_or(i128::MAX);
                 apply_wallet_delta(&wtx, &ticker, &addr, a, a, 0, 0, occurred_at)?;
+                bump_mint_total(&wtx, &ticker, amount)?;
                 events.push(self.new_event(
                     &ticker,
                     EventFamily::Mint,
@@ -1078,6 +1086,10 @@ impl Syncer {
                     // subsequent credits do NOT re-block.
                     let was_blocked = wallet_is_blocked(&wtx, &ticker, &addr)?;
                     apply_wallet_delta(&wtx, &ticker, &addr, a, a, 0, 0, occurred_at)?;
+                    // Coinbase issuance counts toward the supply cap —
+                    // ord-tap's `dc/<tick>` counter decrements on both
+                    // `dmt-mint` admits and DMT-reward coinbase credits.
+                    bump_mint_total(&wtx, &ticker, share.share_amount)?;
                     if share.should_lock_on_first_credit {
                         // dmtrwd marker is PERMANENT — idempotent put.
                         // Needed for the transfer-execution shield
@@ -2031,6 +2043,40 @@ fn is_dmt_reward_address(wtx: &redb::WriteTransaction, address: &str) -> Result<
     let table = wtx.open_table(DMT_REWARD_ADDRESSES)?;
     let found = table.get(address)?.is_some();
     Ok(found)
+}
+
+fn read_mint_total(wtx: &redb::WriteTransaction, ticker: &str) -> Result<u128> {
+    let table = wtx.open_table(MINT_TOTALS)?;
+    let Some(raw) = table.get(ticker)? else {
+        return Ok(0);
+    };
+    let bytes = raw.value();
+    if bytes.len() != 16 {
+        return Ok(0);
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    Ok(u128::from_le_bytes(arr))
+}
+
+fn bump_mint_total(wtx: &redb::WriteTransaction, ticker: &str, delta: u128) -> Result<()> {
+    let mut table = wtx.open_table(MINT_TOTALS)?;
+    let current: u128 = match table.get(ticker)? {
+        Some(raw) => {
+            let bytes = raw.value();
+            if bytes.len() == 16 {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(bytes);
+                u128::from_le_bytes(a)
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
+    let next = current.saturating_add(delta);
+    table.insert(ticker, next.to_le_bytes().as_slice())?;
+    Ok(())
 }
 
 fn set_wallet_locked_flag(

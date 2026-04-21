@@ -67,12 +67,14 @@ pub fn resolve_mints(
     block_height: u64,
     already_claimed_blocks: &std::collections::HashSet<u64>,
     mut candidates: Vec<MintCandidate>,
+    cumulative_issued: u128,
 ) -> MintResolution {
     candidates.sort_by_key(|c| (c.payload.block_number, c.inscription_number));
     let mut admitted = Vec::new();
     let mut rejected = Vec::new();
     let mut post_activation_ignored = Vec::new();
     let mut claimed_now: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut running_total: u128 = cumulative_issued;
 
     let post_activation = deployment
         .coinbase_activation
@@ -103,8 +105,13 @@ pub fn resolve_mints(
             }
             _ => {}
         }
-        // `blk` range sanity (nat-backend derive.rs:343).
-        if c.payload.block_number == 0 || c.payload.block_number > block_height {
+        // `blk` range sanity. Ord-tap only rejects negative or
+        // future-dated `blk` (see `/tmp/ot_dmt_mint.rs:102-104`); a
+        // value of `0` is admitted and simply points at the genesis
+        // block's bits, which is 0 and gets silently dropped as a
+        // scarcity-zero mint downstream. We mirror that — no special
+        // rejection of `blk=0`.
+        if c.payload.block_number > block_height {
             rejected.push(RejectedMint {
                 candidate: c,
                 reason: "blk_out_of_range",
@@ -134,10 +141,24 @@ pub fn resolve_mints(
             });
             continue;
         }
+        // Supply-cap clamp (ord-tap parity): if cumulative issuance
+        // would exceed `max_supply`, clamp this mint to the exact
+        // remaining budget. Reject if the remaining budget is zero.
+        let remaining = deployment.max_supply.saturating_sub(running_total);
+        if remaining == 0 {
+            claimed_now.insert(blk);
+            rejected.push(RejectedMint {
+                candidate: c,
+                reason: "supply_cap_reached",
+            });
+            continue;
+        }
+        let admit_amount = amount.min(remaining);
+        running_total = running_total.saturating_add(admit_amount);
         claimed_now.insert(blk);
         admitted.push(AdmittedMint {
             candidate: c,
-            amount,
+            amount: admit_amount,
         });
     }
 
