@@ -35,7 +35,7 @@ ordinals indexer.
   - `txindex=1` (we read raw tx witnesses)
   - `rest=1` (we fetch full blocks via the REST binary endpoint)
 - **Rust 1.75+** to build from source
-- **~2 GB free disk** for `index.redb` plus headroom
+- **~10 GB free disk** for `index.redb` plus headroom
 - Read access to the cookie file, or RPC user/password credentials
 
 ## Quickstart
