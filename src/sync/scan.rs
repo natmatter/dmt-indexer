@@ -548,17 +548,23 @@ impl Syncer {
                 // dmt-indexer v0.1.0 indexes only $NAT. Non-NAT
                 // DMT/TAP inscriptions (even well-formed ones) are
                 // skipped here without being registered, so the rest
-                // of the pipeline never wastes work on them. The
-                // ticker-filter is the single source of truth for our
-                // scope; every code path below assumes ticker == "nat".
-                if !is_indexed_ticker(payload.ticker()) {
+                // of the pipeline never wastes work on them.
+                //
+                // Form depends on op per ord-tap. dmt-deploy registers
+                // the ticker under its `dmt-`-prefixed effective form
+                // (`dmt-nat`) and dmt-mint does the same prefix prepend
+                // at lookup. Every other op (token-transfer/send/trade
+                // /auth/block/unblock) looks up the deploy literally
+                // under the ticker supplied in the payload — so the
+                // payload MUST carry the long form `dmt-nat`, not the
+                // short `nat`. Accepting bare `nat` for transfer-style
+                // ops over-admits inscriptions ord-tap rejects (see
+                // f88d1954…5a i0 at block 824,343, which reserved 1,000
+                // units of transferable and cascaded a −11.86B short
+                // through bc1plzjl35 → bc1pjhq8xseesnjv).
+                if !envelope_matches_indexed(&payload) {
                     continue;
                 }
-                // Per DMT docs, `token-transfer` inscriptions carry the
-                // long-form ticker `dmt-<name>` while `dmt-deploy` and
-                // `dmt-mint` carry the short form `<name>`. Strip the
-                // prefix so the rest of the pipeline sees one canonical
-                // ticker string regardless of which op produced it.
                 let tick_canon = canonical_ticker(payload.ticker());
                 match payload {
                     TapEnvelope::Deploy(_dp) => {
@@ -1762,11 +1768,21 @@ impl Syncer {
     }
 }
 
-/// The single allowlisted ticker for this build. v0.1.0 ships NAT only.
-/// Returns true if the on-chain TAP payload's ticker should be
-/// processed by the indexer.
-fn is_indexed_ticker(ticker: &str) -> bool {
-    canonical_ticker(ticker) == "nat"
+/// Accept only TAP payloads whose ticker matches the indexed asset in
+/// the form ord-tap expects for that op.
+///
+/// ord-tap's dmt-deploy stores the deploy under `dmt-<short>`, and
+/// dmt-mint prepends the same prefix on lookup, so both accept the
+/// short form `nat`. Every other op does a literal `d/<tick>` lookup,
+/// so it only accepts the long form `dmt-nat` (case-insensitive).
+/// Mirroring this is necessary for balance parity — see scan.rs
+/// comment at the admission site.
+fn envelope_matches_indexed(env: &TapEnvelope) -> bool {
+    let t = env.ticker().to_ascii_lowercase();
+    match env {
+        TapEnvelope::Deploy(_) | TapEnvelope::Mint(_) => t == "nat",
+        _ => t == "dmt-nat",
+    }
 }
 
 /// Fold a raw on-chain ticker string to its canonical form.
