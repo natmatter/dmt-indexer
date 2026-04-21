@@ -399,8 +399,7 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
                     ev.event_type,
                     crate::ledger::event::EventType::CoinbaseRewardCredit
                         | crate::ledger::event::EventType::CoinbaseRewardLocked
-                ) && ev.block_height
-                    >= crate::ledger::deploy::NAT_MINER_TRANSFER_ACTIVATION
+                ) && ev.block_height >= crate::ledger::deploy::NAT_MINER_TRANSFER_ACTIVATION
                 {
                     let mut m = tx.open_table(crate::store::tables::DMT_REWARD_ADDRESSES)?;
                     if m.get(addr.as_str())?.is_none() {

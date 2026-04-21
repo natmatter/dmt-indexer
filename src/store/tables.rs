@@ -67,8 +67,7 @@ pub const DMT_REWARD_ADDRESSES: TableDefinition<'static, &str, u8> =
 /// coinbase credit; the mint resolver clamps each candidate's amount
 /// so `cumulative + amount <= max_supply` per the deploy's `max`
 /// field. Mirrors ord-tap's `dc/<tick>` "tokens_left" counter.
-pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> =
-    TableDefinition::new("mint_totals");
+pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("mint_totals");
 
 /// Carrier map: which outpoint currently carries which inscription.
 /// Keyed by `{txid}:{vout}`, value = JSON InscriptionOwner.
@@ -117,6 +116,8 @@ pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(STATS)?;
     let _ = tx.open_table(DAILY_ACTIVE_ADDRESSES)?;
     let _ = tx.open_table(TRANSFERABLES_BY_SENDER)?;
+    let _ = tx.open_table(DMT_REWARD_ADDRESSES)?;
+    let _ = tx.open_table(MINT_TOTALS)?;
     Ok(())
 }
 

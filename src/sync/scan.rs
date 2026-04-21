@@ -2011,11 +2011,7 @@ fn set_wallet_locked(wtx: &redb::WriteTransaction, ticker: &str, address: &str) 
     set_wallet_locked_flag(wtx, ticker, address, true)
 }
 
-fn wallet_is_blocked(
-    wtx: &redb::WriteTransaction,
-    ticker: &str,
-    address: &str,
-) -> Result<bool> {
+fn wallet_is_blocked(wtx: &redb::WriteTransaction, ticker: &str, address: &str) -> Result<bool> {
     let table = wtx.open_table(WALLET_STATE)?;
     let Some(raw) = table.get((ticker, address))? else {
         return Ok(false);
