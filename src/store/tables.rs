@@ -99,6 +99,40 @@ pub const INSCRIPTIONS: TableDefinition<'static, &str, &[u8]> =
 /// Sync stats — updated per block for diagnostics / /metrics.
 pub const STATS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("stats");
 
+/// Pending `token-send` inscriptions: key = inscription_id,
+/// value = JSON `PendingSend`. Inserted at reveal; `consumed_height`
+/// set at first move (self-tap rule). Truncated on rewind past
+/// inscribed_height, and `consumed_height` cleared on rewind past the
+/// move height. Mirrors the `a/<ins_id>` accumulator in ord-tap.
+pub const PENDING_SENDS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("pending_sends");
+
+/// Registered `token-auth` create records: key = authority inscription
+/// id (the `auth` field referenced by redeems), value =
+/// JSON `TokenAuthRecord`. Written only after the create form's
+/// signature has verified at move time. Mirrors ord-tap's
+/// `tains/<ins_id>` + `ta/<addr>` family.
+pub const TOKEN_AUTH_RECORDS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("token_auth_records");
+
+/// Auth cancel markers: key = cancelled authority inscription id,
+/// value = 1. Presence blocks future redeems referencing that auth.
+/// Mirrors ord-tap's `tac/<auth_id>`.
+pub const TOKEN_AUTH_CANCELS: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("token_auth_cancels");
+
+/// Signature replay guard: key = 64-byte compact-sig hex (lowercase),
+/// value = 1. Presence blocks reuse of a signature across multiple
+/// token-auth redeems / creates. Mirrors ord-tap's `tah/<sig>`.
+pub const TOKEN_AUTH_SIG_REPLAY: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("token_auth_sig_replay");
+
+/// Pending `token-auth` accumulators awaiting first-transfer settlement.
+/// Key = inscription_id, value = JSON `PendingAuth` (form-specific).
+/// Mirrors ord-tap's `a/<ins_id>` for token-auth specifically.
+pub const PENDING_AUTHS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("pending_auths");
+
 pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(META)?;
     let _ = tx.open_table(DEPLOYMENTS)?;
@@ -118,6 +152,11 @@ pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(TRANSFERABLES_BY_SENDER)?;
     let _ = tx.open_table(DMT_REWARD_ADDRESSES)?;
     let _ = tx.open_table(MINT_TOTALS)?;
+    let _ = tx.open_table(PENDING_SENDS)?;
+    let _ = tx.open_table(PENDING_AUTHS)?;
+    let _ = tx.open_table(TOKEN_AUTH_RECORDS)?;
+    let _ = tx.open_table(TOKEN_AUTH_CANCELS)?;
+    let _ = tx.open_table(TOKEN_AUTH_SIG_REPLAY)?;
     Ok(())
 }
 
@@ -188,6 +227,71 @@ pub struct DailyStats {
     pub minted: u128,
     pub burned: u128,
     pub active_addresses: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSendItem {
+    pub ticker: String,
+    pub recipient: String,
+    pub amount: u128,
+    #[serde(default)]
+    pub dta: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSend {
+    pub creator: String,
+    pub inscribed_height: u64,
+    pub items: Vec<PendingSendItem>,
+    #[serde(default)]
+    pub consumed_height: Option<u64>,
+}
+
+/// Form tag for a pending `token-auth` accumulator, mirroring the
+/// three payload shapes. Stored only until first-transfer settlement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingAuthForm {
+    Create {
+        /// Literal ticker strings from the `auth` array, byte-identical
+        /// to the original payload. Used both as the whitelist and for
+        /// rebuilding the signature message at move time.
+        auth_tickers: Vec<String>,
+        sig_v: String,
+        sig_r: String,
+        sig_s: String,
+        hash_hex: String,
+        salt: String,
+        /// Pre-serialized JSON for the `auth` array (preserve_order
+        /// bytes). Stored so signature verification at move time uses
+        /// the exact byte sequence the signer signed.
+        auth_array_json: String,
+    },
+    Cancel {
+        cancel_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAuth {
+    pub creator: String,
+    pub inscribed_height: u64,
+    pub form: PendingAuthForm,
+    #[serde(default)]
+    pub consumed_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenAuthRecord {
+    pub inscription_id: String,
+    /// Source wallet for redeems. ord-tap's `link.addr`.
+    pub authority_addr: String,
+    /// Whitelisted tickers — if empty, post-916,233 check is skipped.
+    pub whitelisted_tickers: Vec<String>,
+    /// Recovered signer pubkey (uncompressed hex, mirrors ord-tap's
+    /// `pubkey_uncompressed` serialization).
+    pub authority_pubkey_hex: String,
+    pub created_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

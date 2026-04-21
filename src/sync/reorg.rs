@@ -12,10 +12,11 @@ use crate::error::Result;
 use crate::ledger::event::LedgerEvent;
 use crate::store::codec::{decode, encode, inverted_balance};
 use crate::store::tables::{
-    cursor_get, cursor_set, Cursor, MintClaim, ValidTransfer, WalletState, ACTIVITY_RECENT,
-    BALANCES_BY_VALUE, DAILY_ACTIVE_ADDRESSES, DAILY_STATS, EVENTS, INSCRIPTION_OWNERS,
-    MINT_CLAIMS, PENDING_CONTROLS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS, WALLET_ACTIVITY,
-    WALLET_STATE,
+    cursor_get, cursor_set, Cursor, MintClaim, PendingAuth, PendingSend, ValidTransfer,
+    WalletState, ACTIVITY_RECENT, BALANCES_BY_VALUE, DAILY_ACTIVE_ADDRESSES, DAILY_STATS, EVENTS,
+    INSCRIPTION_OWNERS, MINT_CLAIMS, PENDING_AUTHS, PENDING_CONTROLS, PENDING_SENDS,
+    TOKEN_AUTH_CANCELS, TOKEN_AUTH_RECORDS, TOKEN_AUTH_SIG_REPLAY, TRANSFERABLES_BY_SENDER,
+    VALID_TRANSFERS, WALLET_ACTIVITY, WALLET_STATE,
 };
 use crate::store::Store;
 
@@ -191,6 +192,85 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
             .collect();
         for k in to_delete {
             pc.remove(k.as_str())?;
+        }
+    }
+    // 1c. PENDING_SENDS: rewind analogous to VALID_TRANSFERS.
+    //     Delete rows whose inscribed_height > height; for surviving
+    //     rows clear consumed_height if it was past height.
+    {
+        let mut ps = tx.open_table(PENDING_SENDS)?;
+        let all: Vec<(String, PendingSend)> = ps
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let id = k.value().to_string();
+                let row: PendingSend = decode(v.value()).ok()?;
+                Some((id, row))
+            })
+            .collect();
+        for (id, mut row) in all {
+            if row.inscribed_height > height {
+                ps.remove(id.as_str())?;
+            } else if matches!(row.consumed_height, Some(ch) if ch > height) {
+                row.consumed_height = None;
+                ps.insert(id.as_str(), encode(&row)?.as_slice())?;
+            }
+        }
+    }
+    // 1d. PENDING_AUTHS: same pattern.
+    {
+        let mut pa = tx.open_table(PENDING_AUTHS)?;
+        let all: Vec<(String, PendingAuth)> = pa
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let id = k.value().to_string();
+                let row: PendingAuth = decode(v.value()).ok()?;
+                Some((id, row))
+            })
+            .collect();
+        for (id, mut row) in all {
+            if row.inscribed_height > height {
+                pa.remove(id.as_str())?;
+            } else if matches!(row.consumed_height, Some(ch) if ch > height) {
+                row.consumed_height = None;
+                pa.insert(id.as_str(), encode(&row)?.as_slice())?;
+            }
+        }
+    }
+    // 1e. Truncate replay-derived auth tables; they're rebuilt from
+    //     TokenAuth* events below.
+    {
+        let mut t = tx.open_table(TOKEN_AUTH_RECORDS)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(TOKEN_AUTH_CANCELS)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(TOKEN_AUTH_SIG_REPLAY)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
         }
     }
     // inscription_owners doesn't carry a height — clear the table and
@@ -408,6 +488,52 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
                 }
             }
 
+            // Re-seed TokenAuth state from events.
+            {
+                use crate::ledger::event::EventType as T;
+                if ev.event_type == T::TokenAuthCreateRegistered {
+                    if let (Some(insc), Some(authority)) = (&ev.inscription_id, &ev.address) {
+                        // Recover whitelist + pubkey from metadata.
+                        let whitelist: Vec<String> = ev
+                            .metadata
+                            .get("whitelisted_tickers")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let pub_hex = ev
+                            .metadata
+                            .get("pubkey")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let mut t = tx.open_table(TOKEN_AUTH_RECORDS)?;
+                        let rec = crate::store::tables::TokenAuthRecord {
+                            inscription_id: insc.clone(),
+                            authority_addr: authority.clone(),
+                            whitelisted_tickers: whitelist,
+                            authority_pubkey_hex: pub_hex,
+                            created_height: ev.block_height,
+                        };
+                        t.insert(insc.as_str(), encode(&rec)?.as_slice())?;
+                    }
+                }
+                if ev.event_type == T::TokenAuthCancelTapped {
+                    if let Some(cancel_id) = ev.metadata.get("cancel_id").and_then(|v| v.as_str()) {
+                        let mut t = tx.open_table(TOKEN_AUTH_CANCELS)?;
+                        t.insert(cancel_id, 1u8)?;
+                    }
+                }
+                // Replay guard repopulates from successful registers +
+                // non-rejected redeems. We don't have the compact sig
+                // in events (deliberate — it's not a user-facing field),
+                // so a rewind re-opens the sig-replay window; in
+                // practice the same sig re-presenting would require the
+                // signer to re-broadcast the same inscription post-rewind.
+            }
             // Re-accumulate the supply-cap counter. Every mint credit
             // and non-burn coinbase credit contributes to cumulative
             // issuance; a burned coinbase output never credits a wallet

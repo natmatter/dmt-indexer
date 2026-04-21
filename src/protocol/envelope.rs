@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::inscription::envelope::Envelope;
+use crate::protocol::auth::{parse_auth, TokenAuthPayload};
 use crate::protocol::control::{parse_control, ControlPayload};
 use crate::protocol::deploy::{parse_deploy, DeployPayload};
 use crate::protocol::mint::{parse_mint, MintPayload};
+use crate::protocol::send::{parse_send, TokenSendPayload};
 use crate::protocol::tap::{decode_envelope, TapOp};
 use crate::protocol::transfer::{parse_transfer, TokenTransferPayload};
 
@@ -22,15 +24,26 @@ pub enum TapEnvelope {
     Mint(MintPayload),
     Transfer(TokenTransferPayload),
     Control(ControlPayload),
+    Send(TokenSendPayload),
+    Auth(TokenAuthPayload),
 }
 
 impl TapEnvelope {
+    /// Representative ticker for the envelope. For multi-item ops this
+    /// returns the first item's ticker; used only by the coarse
+    /// `envelope_matches_indexed` filter in scan.rs.
     pub fn ticker(&self) -> &str {
         match self {
             Self::Deploy(d) => d.ticker.as_str(),
             Self::Mint(m) => m.ticker.as_str(),
             Self::Transfer(t) => t.ticker.as_str(),
             Self::Control(c) => c.ticker.as_str(),
+            Self::Send(s) => s
+                .items
+                .first()
+                .map(|i| i.ticker.as_str())
+                .unwrap_or("dmt-nat"),
+            Self::Auth(a) => a.representative_ticker(),
         }
     }
 
@@ -39,6 +52,8 @@ impl TapEnvelope {
             Self::Deploy(_) => TapOp::DmtDeploy,
             Self::Mint(_) => TapOp::DmtMint,
             Self::Transfer(_) => TapOp::TokenTransfer,
+            Self::Send(_) => TapOp::TokenSend,
+            Self::Auth(_) => TapOp::TokenAuth,
             Self::Control(c) => match c.op {
                 crate::protocol::control::ControlOp::Block => TapOp::BlockTransferables,
                 crate::protocol::control::ControlOp::Unblock => TapOp::UnblockTransferables,
@@ -67,6 +82,8 @@ pub fn decode_tap_payload(env: &Envelope) -> Result<Option<TapEnvelope>> {
         TapOp::DmtDeploy => Ok(Some(TapEnvelope::Deploy(parse_deploy(&body)?))),
         TapOp::DmtMint => Ok(Some(TapEnvelope::Mint(parse_mint(&body)?))),
         TapOp::TokenTransfer => Ok(Some(TapEnvelope::Transfer(parse_transfer(&body)?))),
+        TapOp::TokenSend => Ok(Some(TapEnvelope::Send(parse_send(&body)?))),
+        TapOp::TokenAuth => Ok(Some(TapEnvelope::Auth(parse_auth(&body)?))),
         TapOp::BlockTransferables | TapOp::UnblockTransferables => {
             Ok(Some(TapEnvelope::Control(parse_control(&body)?)))
         }

@@ -42,6 +42,15 @@ pub enum InscriptionKind {
     /// mint balance credits are permanent to the original inscriber and
     /// do not shift when the inscription is sent.
     Mint,
+    /// `token-send` inscriptions. Tracked to consummate a pending send
+    /// on first transfer (creator → per-item recipients).
+    TokenSend,
+    /// `token-auth` inscriptions (create / cancel / redeem forms).
+    /// Tracked to execute the appropriate handler on first transfer.
+    /// Redeem form completes at reveal, but we still track the carrier
+    /// so the auth inscription's `INSCRIPTIONS` row updates on later
+    /// transfers.
+    TokenAuth,
 }
 
 /// Full-fidelity carrier record: the inscription + where in its

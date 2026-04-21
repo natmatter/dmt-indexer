@@ -1,23 +1,27 @@
 pub mod address;
 pub mod amount;
+pub mod auth;
 pub mod bits;
 pub mod control;
 pub mod deploy;
 pub mod element;
 pub mod envelope;
 pub mod mint;
+pub mod send;
 pub mod tap;
 pub mod ticker;
 pub mod transfer;
 
 pub use address::{address_from_script, normalize_address, NormalizedAddress};
 pub use amount::parse_amount;
+pub use auth::{TokenAuthForm, TokenAuthPayload};
 pub use bits::{decode_bits, BitsMode};
 pub use control::{ControlOp, ControlPayload};
 pub use deploy::DeployPayload;
 pub use element::{ElementField, KNOWN_ELEMENTS};
 pub use envelope::{decode_tap_payload, TapEnvelope};
 pub use mint::MintPayload;
+pub use send::{TokenSendItem, TokenSendPayload};
 pub use tap::TapOp;
 pub use ticker::{normalize_ticker, ticker_is_valid_at_height};
 pub use transfer::TokenTransferPayload;

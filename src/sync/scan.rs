@@ -31,6 +31,7 @@ use crate::ledger::transfer::{
     resolve_transfer_inscribes, InscribeResolution, TransferInscribeCandidate,
 };
 use crate::protocol::address::{address_from_script, normalize_address};
+use crate::protocol::auth::TokenAuthForm;
 use crate::protocol::control::ControlOp;
 use crate::protocol::envelope::{decode_tap_payload, TapEnvelope};
 use crate::store::codec::{decode, encode};
@@ -90,6 +91,30 @@ struct ControlInscribe {
     ticker: String,
     address: String,
     op: ControlOp,
+}
+
+struct PendingSendReveal {
+    inscription_id: String,
+    creator: String,
+    tx_index: u32,
+    items: Vec<crate::store::tables::PendingSendItem>,
+}
+
+struct PendingAuthReveal {
+    inscription_id: String,
+    creator: String,
+    tx_index: u32,
+    form: crate::store::tables::PendingAuthForm,
+}
+
+/// Redeems execute at reveal time (unlike create/cancel which settle at
+/// move). Carries the fully-parsed payload plus tx_index + inscriber
+/// owner address.
+struct AuthRedeemReveal {
+    inscription_id: String,
+    tx_index: u32,
+    inscriber_addr: String,
+    payload: crate::protocol::auth::TokenAuthRedeem,
 }
 
 impl Syncer {
@@ -506,6 +531,9 @@ impl Syncer {
         let mut transfer_inscribes_unresolved: Vec<TransferInscribeCandidate> = Vec::new();
         let mut transfer_inscribe_meta: HashMap<String, TransferInscribe> = HashMap::new();
         let mut control_inscribes: Vec<ControlInscribe> = Vec::new();
+        let mut send_reveals: Vec<PendingSendReveal> = Vec::new();
+        let mut auth_reveals: Vec<PendingAuthReveal> = Vec::new();
+        let mut auth_redeem_reveals: Vec<AuthRedeemReveal> = Vec::new();
         let mut fresh_carriers: Vec<(OutPoint, TrackedCarrier, Option<String>)> = Vec::new();
         let mut moves: Vec<(u32, TrackerMove)> = Vec::new();
         let mut inscription_rows: Vec<(String, InscriptionIndex)> = Vec::new();
@@ -720,6 +748,216 @@ impl Syncer {
                                 consumed_height: None,
                             },
                         ));
+                    }
+                    TapEnvelope::Send(sp) => {
+                        // Miner-reward shield at reveal time. ord-tap
+                        // `/tmp/ot_send.rs:26-27`. Shield is also
+                        // re-checked at move time.
+                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
+                            continue;
+                        };
+                        if is_dmt_reward_address(wtx, addr.as_str())? {
+                            continue;
+                        }
+                        // Filter items to the indexed ticker. Per-item
+                        // other-ticker drops are silent (parity with the
+                        // coarse envelope filter).
+                        let mut items: Vec<crate::store::tables::PendingSendItem> = Vec::new();
+                        for it in sp.items.iter() {
+                            if canonical_ticker(it.ticker.as_str()) != "nat" {
+                                continue;
+                            }
+                            items.push(crate::store::tables::PendingSendItem {
+                                ticker: canonical_ticker(it.ticker.as_str()),
+                                recipient: it.recipient.as_str().to_string(),
+                                amount: it.amount,
+                                dta: it.dta.clone(),
+                            });
+                        }
+                        if items.is_empty() {
+                            continue;
+                        }
+                        send_reveals.push(PendingSendReveal {
+                            inscription_id: insc_id.clone(),
+                            creator: addr.as_str().to_string(),
+                            tx_index,
+                            items,
+                        });
+                        let reveal_value = txv
+                            .tx
+                            .output
+                            .get(landing_vout)
+                            .map(|o| o.value.to_sat())
+                            .unwrap_or(0);
+                        fresh_carriers.push((
+                            OutPoint {
+                                txid: txv.txid,
+                                vout: landing_vout as u32,
+                            },
+                            TrackedCarrier {
+                                inscription: TrackedInscription {
+                                    inscription_id: insc_id.clone(),
+                                    ticker: "nat".to_string(),
+                                    kind: InscriptionKind::TokenSend,
+                                },
+                                offset_in_outpoint: 0,
+                                outpoint_value_sats: reveal_value,
+                            },
+                            to_addr.clone(),
+                        ));
+                        inscription_rows.push((
+                            insc_id,
+                            InscriptionIndex {
+                                ticker: "nat".to_string(),
+                                kind: "token-send".to_string(),
+                                original_amount: None,
+                                inscribed_height: block.height,
+                                current_owner_address: to_addr.clone(),
+                                consumed_height: None,
+                            },
+                        ));
+                    }
+                    TapEnvelope::Auth(ap) => {
+                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
+                            continue;
+                        };
+                        let creator = addr.as_str().to_string();
+                        let reveal_value = txv
+                            .tx
+                            .output
+                            .get(landing_vout)
+                            .map(|o| o.value.to_sat())
+                            .unwrap_or(0);
+                        match &ap.form {
+                            TokenAuthForm::Redeem(r) => {
+                                // Redeems execute AT REVEAL. Queue with
+                                // the full payload for the write phase.
+                                auth_redeem_reveals.push(AuthRedeemReveal {
+                                    inscription_id: insc_id.clone(),
+                                    tx_index,
+                                    inscriber_addr: creator.clone(),
+                                    payload: r.clone(),
+                                });
+                                // Track the carrier so INSCRIPTIONS row
+                                // stays fresh on later transfers.
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: "nat".to_string(),
+                                            kind: InscriptionKind::TokenAuth,
+                                        },
+                                        offset_in_outpoint: 0,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: "nat".to_string(),
+                                        kind: "token-auth".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TokenAuthForm::Create(c) => {
+                                // Serialize the auth array byte-exact
+                                // for later re-hash at move time.
+                                let auth_array_json = match serde_json::to_string(&c.auth_array_raw)
+                                {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                let form = crate::store::tables::PendingAuthForm::Create {
+                                    auth_tickers: c.auth_tickers.clone(),
+                                    sig_v: c.sig.v.clone(),
+                                    sig_r: c.sig.r.clone(),
+                                    sig_s: c.sig.s.clone(),
+                                    hash_hex: c.hash.clone(),
+                                    salt: c.salt.clone(),
+                                    auth_array_json,
+                                };
+                                auth_reveals.push(PendingAuthReveal {
+                                    inscription_id: insc_id.clone(),
+                                    creator: creator.clone(),
+                                    tx_index,
+                                    form,
+                                });
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: "nat".to_string(),
+                                            kind: InscriptionKind::TokenAuth,
+                                        },
+                                        offset_in_outpoint: 0,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: "nat".to_string(),
+                                        kind: "token-auth".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TokenAuthForm::Cancel(c) => {
+                                let form = crate::store::tables::PendingAuthForm::Cancel {
+                                    cancel_id: c.cancel_id.clone(),
+                                };
+                                auth_reveals.push(PendingAuthReveal {
+                                    inscription_id: insc_id.clone(),
+                                    creator: creator.clone(),
+                                    tx_index,
+                                    form,
+                                });
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: "nat".to_string(),
+                                            kind: InscriptionKind::TokenAuth,
+                                        },
+                                        offset_in_outpoint: 0,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: "nat".to_string(),
+                                        kind: "token-auth".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                        }
                     }
                     TapEnvelope::Control(cp) => {
                         let Some(_) = deployments.get(tick_canon.as_str()) else {
@@ -939,6 +1177,80 @@ impl Syncer {
                     ));
                 }
             }
+        }
+
+        // 2b. Token-send reveals: register pending_sends rows + emit
+        //     TokenSendInscribeAdmitted. Balance movement happens later
+        //     at move time.
+        for sr in send_reveals {
+            {
+                let mut table = wtx.open_table(tables::PENDING_SENDS)?;
+                let row = tables::PendingSend {
+                    creator: sr.creator.clone(),
+                    inscribed_height: block.height,
+                    items: sr.items.clone(),
+                    consumed_height: None,
+                };
+                table.insert(sr.inscription_id.as_str(), encode(&row)?.as_slice())?;
+            }
+            let total_amount: u128 = sr.items.iter().map(|i| i.amount).sum();
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Send,
+                EventType::TokenSendInscribeAdmitted,
+                block,
+                occurred_at,
+                Some(sr.tx_index),
+                Some(sr.inscription_id),
+                Some(sr.creator),
+                None,
+                EventDelta::default(),
+                serde_json::json!({
+                    "item_count": sr.items.len(),
+                    "total_amount": total_amount.to_string(),
+                }),
+                &block_hash,
+            ));
+        }
+
+        // 2c. Token-auth create/cancel reveals: store accumulator + emit
+        //     lifecycle event. Signature verification is deferred to
+        //     move time for create; cancel fires at move as well.
+        for ar in auth_reveals {
+            {
+                let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
+                let row = tables::PendingAuth {
+                    creator: ar.creator.clone(),
+                    inscribed_height: block.height,
+                    form: ar.form.clone(),
+                    consumed_height: None,
+                };
+                table.insert(ar.inscription_id.as_str(), encode(&row)?.as_slice())?;
+            }
+            let et = match &ar.form {
+                tables::PendingAuthForm::Create { .. } => EventType::TokenAuthCreateInscribed,
+                tables::PendingAuthForm::Cancel { .. } => EventType::TokenAuthCancelInscribed,
+            };
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Auth,
+                et,
+                block,
+                occurred_at,
+                Some(ar.tx_index),
+                Some(ar.inscription_id),
+                Some(ar.creator),
+                None,
+                EventDelta::default(),
+                serde_json::json!({}),
+                &block_hash,
+            ));
+        }
+
+        // 2d. Token-auth redeem reveals: execute balance moves at
+        //     reveal time (ord-tap `/tmp/ot_auth.rs:42-102`).
+        for rr in auth_redeem_reveals {
+            self.process_auth_redeem(wtx, rr, block, occurred_at, &block_hash, &mut events)?;
         }
 
         // 3. Control inscribes
@@ -1190,6 +1502,28 @@ impl Syncer {
                             // No ledger effect — the INSCRIPTIONS owner
                             // column was already refreshed above.
                         }
+                        InscriptionKind::TokenSend => {
+                            self.settle_token_send(
+                                &wtx,
+                                &inscription.inscription_id,
+                                new_owner_address.as_deref(),
+                                block,
+                                occurred_at,
+                                &block_hash,
+                                &mut events,
+                            )?;
+                        }
+                        InscriptionKind::TokenAuth => {
+                            self.settle_token_auth(
+                                &wtx,
+                                &inscription.inscription_id,
+                                new_owner_address.as_deref(),
+                                block,
+                                occurred_at,
+                                &block_hash,
+                                &mut events,
+                            )?;
+                        }
                     }
                 }
                 TrackerMove::Burned { inscription, .. } => {
@@ -1204,8 +1538,10 @@ impl Syncer {
                             &mut events,
                         )?;
                     }
-                    // Mint / control burns: owner column cleared above,
-                    // no ledger event needed.
+                    // Mint / control / token-send / token-auth burns:
+                    // owner column cleared above, no ledger event needed.
+                    // For send/auth pending rows, we leave them in-place
+                    // as unconsumed; a later reorg can still clean up.
                 }
             }
         }
@@ -1452,6 +1788,8 @@ impl Syncer {
                             "token-transfer" => InscriptionKind::TokenTransfer,
                             "control" => InscriptionKind::Control,
                             "dmt-mint" => InscriptionKind::Mint,
+                            "token-send" => InscriptionKind::TokenSend,
+                            "token-auth" => InscriptionKind::TokenAuth,
                             _ => InscriptionKind::Control,
                         },
                     },
@@ -1551,6 +1889,8 @@ impl Syncer {
                     InscriptionKind::TokenTransfer => "token-transfer".to_string(),
                     InscriptionKind::Control => "control".to_string(),
                     InscriptionKind::Mint => "dmt-mint".to_string(),
+                    InscriptionKind::TokenSend => "token-send".to_string(),
+                    InscriptionKind::TokenAuth => "token-auth".to_string(),
                 },
                 current_outpoint: key.clone(),
                 offset_in_outpoint: carrier.offset_in_outpoint,
@@ -1811,6 +2151,632 @@ impl Syncer {
         Ok(())
     }
 
+    /// Settle a `token-send` inscription at move time.
+    ///
+    /// Enforces the self-tap rule (creator must be the transfer's
+    /// new_owner — ord-tap `/tmp/ot_send.rs:87`), re-checks the miner
+    /// reward shield, then iterates items in payload order invoking
+    /// [`crate::ledger::send::execute_send_item`] per item.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_token_send(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        inscription_id: &str,
+        new_owner: Option<&str>,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let pending: Option<tables::PendingSend> = {
+            let table = wtx.open_table(tables::PENDING_SENDS)?;
+            let raw = table.get(inscription_id)?;
+            raw.and_then(|v| decode::<tables::PendingSend>(v.value()).ok())
+        };
+        let Some(mut ps) = pending else {
+            return Ok(());
+        };
+        if ps.consumed_height.is_some() {
+            return Ok(());
+        }
+        // Self-tap rule: creator == new_owner (ord-tap line 87).
+        let self_tap = matches!(new_owner, Some(o) if o == ps.creator);
+        if !self_tap {
+            // Not a self-tap — consume without emitting any item events
+            // so the pending row doesn't get re-processed on a later
+            // transfer. Parity with ord-tap, which early-returns.
+            ps.consumed_height = Some(block.height);
+            let mut table = wtx.open_table(tables::PENDING_SENDS)?;
+            table.insert(inscription_id, encode(&ps)?.as_slice())?;
+            return Ok(());
+        }
+        // Miner-reward shield at move time too — ord-tap /tmp/ot_send.rs:90-91.
+        if is_dmt_reward_address(wtx, &ps.creator)? {
+            ps.consumed_height = Some(block.height);
+            let mut table = wtx.open_table(tables::PENDING_SENDS)?;
+            table.insert(inscription_id, encode(&ps)?.as_slice())?;
+            return Ok(());
+        }
+        use crate::ledger::send::{execute_send_item, SendItemOutcome};
+        for item in &ps.items {
+            let outcome = execute_send_item(
+                wtx,
+                &item.ticker,
+                &ps.creator,
+                &item.recipient,
+                item.amount,
+                occurred_at,
+            )?;
+            let a = i128::try_from(item.amount).unwrap_or(i128::MAX);
+            match outcome {
+                SendItemOutcome::Sent => {
+                    events.push(self.new_event(
+                        &item.ticker,
+                        EventFamily::Send,
+                        EventType::TokenSendDebit,
+                        block,
+                        occurred_at,
+                        None,
+                        Some(inscription_id.to_string()),
+                        Some(ps.creator.clone()),
+                        Some(item.recipient.clone()),
+                        EventDelta {
+                            delta_total: -a,
+                            delta_available: -a,
+                            ..Default::default()
+                        },
+                        serde_json::json!({ "amount": item.amount.to_string() }),
+                        block_hash,
+                    ));
+                    events.push(self.new_event(
+                        &item.ticker,
+                        EventFamily::Send,
+                        EventType::TokenSendCredit,
+                        block,
+                        occurred_at,
+                        None,
+                        Some(inscription_id.to_string()),
+                        Some(item.recipient.clone()),
+                        Some(ps.creator.clone()),
+                        EventDelta {
+                            delta_total: a,
+                            delta_available: a,
+                            ..Default::default()
+                        },
+                        serde_json::json!({ "amount": item.amount.to_string() }),
+                        block_hash,
+                    ));
+                }
+                SendItemOutcome::SelfSend => {
+                    // Emit paired 0-delta events for audit trail; no
+                    // wallet_state movement.
+                    events.push(self.new_event(
+                        &item.ticker,
+                        EventFamily::Send,
+                        EventType::TokenSendDebit,
+                        block,
+                        occurred_at,
+                        None,
+                        Some(inscription_id.to_string()),
+                        Some(ps.creator.clone()),
+                        Some(item.recipient.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "self_send": true,
+                        }),
+                        block_hash,
+                    ));
+                    events.push(self.new_event(
+                        &item.ticker,
+                        EventFamily::Send,
+                        EventType::TokenSendCredit,
+                        block,
+                        occurred_at,
+                        None,
+                        Some(inscription_id.to_string()),
+                        Some(item.recipient.clone()),
+                        Some(ps.creator.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "self_send": true,
+                        }),
+                        block_hash,
+                    ));
+                }
+                SendItemOutcome::Skipped => {
+                    events.push(self.new_event(
+                        &item.ticker,
+                        EventFamily::Send,
+                        EventType::TokenSendSkipped,
+                        block,
+                        occurred_at,
+                        None,
+                        Some(inscription_id.to_string()),
+                        Some(ps.creator.clone()),
+                        Some(item.recipient.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "reason": "insufficient_available",
+                        }),
+                        block_hash,
+                    ));
+                }
+            }
+        }
+        ps.consumed_height = Some(block.height);
+        {
+            let mut table = wtx.open_table(tables::PENDING_SENDS)?;
+            table.insert(inscription_id, encode(&ps)?.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Settle a `token-auth` inscription (create or cancel form) at
+    /// move time. Redeem form settles at reveal; see
+    /// [`Self::process_auth_redeem`].
+    #[allow(clippy::too_many_arguments)]
+    fn settle_token_auth(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        inscription_id: &str,
+        new_owner: Option<&str>,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let pending: Option<tables::PendingAuth> = {
+            let table = wtx.open_table(tables::PENDING_AUTHS)?;
+            let raw = table.get(inscription_id)?;
+            raw.and_then(|v| decode::<tables::PendingAuth>(v.value()).ok())
+        };
+        let Some(mut pa) = pending else {
+            return Ok(());
+        };
+        if pa.consumed_height.is_some() {
+            return Ok(());
+        }
+        // Self-tap rule: acc.addr == new_owner (ord-tap auth line 129).
+        let self_tap = matches!(new_owner, Some(o) if o == pa.creator);
+        if !self_tap {
+            pa.consumed_height = Some(block.height);
+            let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
+            table.insert(inscription_id, encode(&pa)?.as_slice())?;
+            return Ok(());
+        }
+        match &pa.form {
+            tables::PendingAuthForm::Cancel { cancel_id } => {
+                // Record cancel marker (keyed by the referenced authority id).
+                {
+                    let mut t = wtx.open_table(tables::TOKEN_AUTH_CANCELS)?;
+                    t.insert(cancel_id.as_str(), 1u8)?;
+                }
+                events.push(self.new_event(
+                    "nat",
+                    EventFamily::Auth,
+                    EventType::TokenAuthCancelTapped,
+                    block,
+                    occurred_at,
+                    None,
+                    Some(inscription_id.to_string()),
+                    Some(pa.creator.clone()),
+                    None,
+                    EventDelta::default(),
+                    serde_json::json!({ "cancel_id": cancel_id }),
+                    block_hash,
+                ));
+            }
+            tables::PendingAuthForm::Create {
+                auth_tickers,
+                sig_v,
+                sig_r,
+                sig_s,
+                hash_hex,
+                salt,
+                auth_array_json,
+            } => {
+                let msg_hash = crate::crypto::ecdsa_recover::compute_msg_hash(
+                    auth_array_json.as_bytes(),
+                    salt,
+                );
+                let verify_result = crate::crypto::ecdsa_recover::verify_ecdsa_recover(
+                    sig_v, sig_r, sig_s, hash_hex, &msg_hash,
+                );
+                match verify_result {
+                    Ok((compact_sig_hex, pubkey_hex)) => {
+                        // Replay guard: if this sig was already used,
+                        // reject even the create.
+                        let already_used = {
+                            let t = wtx.open_table(tables::TOKEN_AUTH_SIG_REPLAY)?;
+                            let got = t.get(compact_sig_hex.as_str())?;
+                            got.is_some()
+                        };
+                        if already_used {
+                            events.push(self.new_event(
+                                "nat",
+                                EventFamily::Auth,
+                                EventType::TokenAuthCreateRejected,
+                                block,
+                                occurred_at,
+                                None,
+                                Some(inscription_id.to_string()),
+                                Some(pa.creator.clone()),
+                                None,
+                                EventDelta::default(),
+                                serde_json::json!({ "reason": "sig_replayed" }),
+                                block_hash,
+                            ));
+                        } else {
+                            {
+                                let mut t = wtx.open_table(tables::TOKEN_AUTH_RECORDS)?;
+                                let rec = tables::TokenAuthRecord {
+                                    inscription_id: inscription_id.to_string(),
+                                    authority_addr: pa.creator.clone(),
+                                    whitelisted_tickers: auth_tickers.clone(),
+                                    authority_pubkey_hex: pubkey_hex.clone(),
+                                    created_height: block.height,
+                                };
+                                t.insert(inscription_id, encode(&rec)?.as_slice())?;
+                            }
+                            {
+                                let mut t = wtx.open_table(tables::TOKEN_AUTH_SIG_REPLAY)?;
+                                t.insert(compact_sig_hex.as_str(), 1u8)?;
+                            }
+                            events.push(self.new_event(
+                                "nat",
+                                EventFamily::Auth,
+                                EventType::TokenAuthCreateRegistered,
+                                block,
+                                occurred_at,
+                                None,
+                                Some(inscription_id.to_string()),
+                                Some(pa.creator.clone()),
+                                None,
+                                EventDelta::default(),
+                                serde_json::json!({
+                                    "whitelisted_tickers": auth_tickers,
+                                    "pubkey": pubkey_hex,
+                                }),
+                                block_hash,
+                            ));
+                        }
+                    }
+                    Err(fail) => {
+                        events.push(self.new_event(
+                            "nat",
+                            EventFamily::Auth,
+                            EventType::TokenAuthCreateRejected,
+                            block,
+                            occurred_at,
+                            None,
+                            Some(inscription_id.to_string()),
+                            Some(pa.creator.clone()),
+                            None,
+                            EventDelta::default(),
+                            serde_json::json!({ "reason": format!("{:?}", fail) }),
+                            block_hash,
+                        ));
+                    }
+                }
+            }
+        }
+        pa.consumed_height = Some(block.height);
+        {
+            let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
+            table.insert(inscription_id, encode(&pa)?.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Execute a `token-auth` redeem (balance-moving path) at reveal
+    /// time. Mirrors ord-tap `/tmp/ot_auth.rs:42-102`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_auth_redeem(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        rr: AuthRedeemReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let p = &rr.payload;
+        // 1. Verify ECDSA over sha256(serde_json(redeem_subtree) || salt).
+        let redeem_json = match serde_json::to_vec(&p.redeem_subtree_raw) {
+            Ok(v) => v,
+            Err(_) => {
+                events.push(self.new_event(
+                    "nat",
+                    EventFamily::Auth,
+                    EventType::TokenAuthRedeemRejected,
+                    block,
+                    occurred_at,
+                    Some(rr.tx_index),
+                    Some(rr.inscription_id.clone()),
+                    Some(rr.inscriber_addr.clone()),
+                    None,
+                    EventDelta::default(),
+                    serde_json::json!({ "reason": "redeem_subtree_encode_failed" }),
+                    block_hash,
+                ));
+                return Ok(());
+            }
+        };
+        let msg_hash = crate::crypto::ecdsa_recover::compute_msg_hash(&redeem_json, &p.salt);
+        let verify = crate::crypto::ecdsa_recover::verify_ecdsa_recover(
+            &p.sig.v, &p.sig.r, &p.sig.s, &p.hash, &msg_hash,
+        );
+        let (compact_sig, redeemer_pubkey_hex) = match verify {
+            Ok(ok) => ok,
+            Err(fail) => {
+                events.push(self.new_event(
+                    "nat",
+                    EventFamily::Auth,
+                    EventType::TokenAuthRedeemRejected,
+                    block,
+                    occurred_at,
+                    Some(rr.tx_index),
+                    Some(rr.inscription_id.clone()),
+                    Some(rr.inscriber_addr.clone()),
+                    None,
+                    EventDelta::default(),
+                    serde_json::json!({ "reason": format!("{:?}", fail) }),
+                    block_hash,
+                ));
+                return Ok(());
+            }
+        };
+        // 2. Authority lookup.
+        let rec: Option<tables::TokenAuthRecord> = {
+            let t = wtx.open_table(tables::TOKEN_AUTH_RECORDS)?;
+            let raw = t.get(p.auth_id.as_str())?;
+            raw.and_then(|v| decode::<tables::TokenAuthRecord>(v.value()).ok())
+        };
+        let Some(rec) = rec else {
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "authority_missing", "auth_id": p.auth_id }),
+                block_hash,
+            ));
+            return Ok(());
+        };
+        // 3. Pubkey equality.
+        if rec.authority_pubkey_hex.to_lowercase() != redeemer_pubkey_hex.to_lowercase() {
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "pubkey_mismatch" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        // 4. Replay guard.
+        let replayed = {
+            let t = wtx.open_table(tables::TOKEN_AUTH_SIG_REPLAY)?;
+            let got = t.get(compact_sig.as_str())?;
+            got.is_some()
+        };
+        if replayed {
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "sig_replayed" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        // 5. Whitelist at height >= 916,233.
+        const TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT: u64 = 916_233;
+        if block.height >= TAP_AUTH_ITEM_LENGTH_ACTIVATION_HEIGHT
+            && !rec.whitelisted_tickers.is_empty()
+        {
+            for it in &p.items {
+                if !rec.whitelisted_tickers.iter().any(|t| t == &it.ticker) {
+                    events.push(self.new_event(
+                        "nat",
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemRejected,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(rr.inscriber_addr.clone()),
+                        None,
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "reason": "whitelist_violation",
+                            "ticker": it.ticker,
+                        }),
+                        block_hash,
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        // 6. Cancel guard.
+        let cancelled = {
+            let t = wtx.open_table(tables::TOKEN_AUTH_CANCELS)?;
+            let got = t.get(rec.inscription_id.as_str())?;
+            got.is_some()
+        };
+        if cancelled {
+            events.push(self.new_event(
+                "nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "authority_cancelled" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        // 7. Per-item execution.
+        use crate::ledger::auth::{execute_redeem_item, RedeemItemOutcome};
+        for item in &p.items {
+            let canon = canonical_ticker(&item.ticker);
+            // We only index NAT. Non-NAT items in a mixed-ticker redeem
+            // are silently skipped; if this turns out to matter for the
+            // audit we'll revisit.
+            if canon != "nat" {
+                continue;
+            }
+            let a = i128::try_from(item.amount).unwrap_or(i128::MAX);
+            let outcome = execute_redeem_item(
+                wtx,
+                &canon,
+                &rec.authority_addr,
+                &item.address,
+                item.amount,
+                occurred_at,
+            )?;
+            match outcome {
+                RedeemItemOutcome::Credited => {
+                    events.push(self.new_event(
+                        &canon,
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemDebit,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(rec.authority_addr.clone()),
+                        Some(item.address.clone()),
+                        EventDelta {
+                            delta_total: -a,
+                            delta_available: -a,
+                            ..Default::default()
+                        },
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "auth_id": rec.inscription_id,
+                        }),
+                        block_hash,
+                    ));
+                    events.push(self.new_event(
+                        &canon,
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemCredit,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(item.address.clone()),
+                        Some(rec.authority_addr.clone()),
+                        EventDelta {
+                            delta_total: a,
+                            delta_available: a,
+                            ..Default::default()
+                        },
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "auth_id": rec.inscription_id,
+                        }),
+                        block_hash,
+                    ));
+                }
+                RedeemItemOutcome::SelfSend => {
+                    // Paired audit events, 0 deltas.
+                    events.push(self.new_event(
+                        &canon,
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemDebit,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(rec.authority_addr.clone()),
+                        Some(item.address.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "self_send": true,
+                            "auth_id": rec.inscription_id,
+                        }),
+                        block_hash,
+                    ));
+                    events.push(self.new_event(
+                        &canon,
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemCredit,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(item.address.clone()),
+                        Some(rec.authority_addr.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "self_send": true,
+                            "auth_id": rec.inscription_id,
+                        }),
+                        block_hash,
+                    ));
+                }
+                RedeemItemOutcome::Skipped => {
+                    events.push(self.new_event(
+                        &canon,
+                        EventFamily::Auth,
+                        EventType::TokenAuthRedeemSkipped,
+                        block,
+                        occurred_at,
+                        Some(rr.tx_index),
+                        Some(rr.inscription_id.clone()),
+                        Some(rec.authority_addr.clone()),
+                        Some(item.address.clone()),
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": item.amount.to_string(),
+                            "reason": "insufficient_available",
+                            "auth_id": rec.inscription_id,
+                        }),
+                        block_hash,
+                    ));
+                }
+            }
+        }
+        // 8. Write replay-guard marker on successful completion.
+        {
+            let mut t = wtx.open_table(tables::TOKEN_AUTH_SIG_REPLAY)?;
+            t.insert(compact_sig.as_str(), 1u8)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_event(
         &mut self,
@@ -1877,6 +2843,31 @@ fn envelope_matches_indexed(env: &TapEnvelope) -> bool {
     let t = env.ticker().to_ascii_lowercase();
     match env {
         TapEnvelope::Deploy(_) | TapEnvelope::Mint(_) => t == "nat",
+        // token-send / token-auth carry multiple items, each with its own
+        // tick. We admit the envelope if ANY item references dmt-nat —
+        // unrelated-ticker items inside the same inscription are filtered
+        // at the per-item stage.
+        TapEnvelope::Send(s) => s
+            .items
+            .iter()
+            .any(|it| canonical_ticker(it.ticker.as_str()) == "nat"),
+        TapEnvelope::Auth(a) => match &a.form {
+            // Cancel form carries no ticker at all — admit. The cancel
+            // either references a NAT authority (useful) or doesn't
+            // (harmless; our scan won't find the auth record).
+            crate::protocol::auth::TokenAuthForm::Cancel(_) => true,
+            // Create form: admit if the whitelist is empty OR mentions
+            // dmt-nat. Empty is ord-tap's permissive default.
+            crate::protocol::auth::TokenAuthForm::Create(c) => {
+                c.auth_tickers.is_empty()
+                    || c.auth_tickers.iter().any(|t| canonical_ticker(t) == "nat")
+            }
+            // Redeem form: admit if any item references dmt-nat.
+            crate::protocol::auth::TokenAuthForm::Redeem(r) => r
+                .items
+                .iter()
+                .any(|it| canonical_ticker(it.ticker.as_str()) == "nat"),
+        },
         _ => t == "dmt-nat",
     }
 }
@@ -1922,6 +2913,14 @@ async fn fetch_block_bits_retry(rpc: &RpcClient, height: u64) -> Result<u32> {
 }
 
 fn describe_move(mv: &TrackerMove, _height: u64) -> Option<(String, Option<String>, bool)> {
+    let consumed = |k: InscriptionKind| {
+        matches!(
+            k,
+            InscriptionKind::TokenTransfer
+                | InscriptionKind::TokenSend
+                | InscriptionKind::TokenAuth
+        )
+    };
     match mv {
         TrackerMove::Moved {
             inscription,
@@ -1930,12 +2929,12 @@ fn describe_move(mv: &TrackerMove, _height: u64) -> Option<(String, Option<Strin
         } => Some((
             inscription.inscription_id.clone(),
             new_owner_address.clone(),
-            matches!(inscription.kind, InscriptionKind::TokenTransfer),
+            consumed(inscription.kind),
         )),
         TrackerMove::Burned { inscription, .. } => Some((
             inscription.inscription_id.clone(),
             None,
-            matches!(inscription.kind, InscriptionKind::TokenTransfer),
+            consumed(inscription.kind),
         )),
     }
 }

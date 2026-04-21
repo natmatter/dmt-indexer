@@ -11,6 +11,8 @@ pub enum TapOp {
     DmtDeploy,
     DmtMint,
     TokenTransfer,
+    TokenSend,
+    TokenAuth,
     BlockTransferables,
     UnblockTransferables,
 }
@@ -21,6 +23,8 @@ impl TapOp {
             "dmt-deploy" => Some(Self::DmtDeploy),
             "dmt-mint" => Some(Self::DmtMint),
             "token-transfer" => Some(Self::TokenTransfer),
+            "token-send" => Some(Self::TokenSend),
+            "token-auth" => Some(Self::TokenAuth),
             "block-transferables" => Some(Self::BlockTransferables),
             "unblock-transferables" => Some(Self::UnblockTransferables),
             _ => None,
@@ -32,6 +36,8 @@ impl TapOp {
             Self::DmtDeploy => "dmt-deploy",
             Self::DmtMint => "dmt-mint",
             Self::TokenTransfer => "token-transfer",
+            Self::TokenSend => "token-send",
+            Self::TokenAuth => "token-auth",
             Self::BlockTransferables => "block-transferables",
             Self::UnblockTransferables => "unblock-transferables",
         }
@@ -113,6 +119,18 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        assert!(decode_envelope(br#"{"p":"tap","op":"token-send"}"#).is_err());
+        assert!(decode_envelope(br#"{"p":"tap","op":"token-trade"}"#).is_err());
+    }
+
+    #[test]
+    fn accepts_token_send() {
+        let (op, _) = decode_envelope(br#"{"p":"tap","op":"token-send"}"#).unwrap();
+        assert_eq!(op, TapOp::TokenSend);
+    }
+
+    #[test]
+    fn accepts_token_auth() {
+        let (op, _) = decode_envelope(br#"{"p":"tap","op":"token-auth"}"#).unwrap();
+        assert_eq!(op, TapOp::TokenAuth);
     }
 }

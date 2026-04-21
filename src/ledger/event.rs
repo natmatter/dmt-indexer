@@ -11,6 +11,8 @@ pub enum EventFamily {
     Transfer,
     Control,
     Coinbase,
+    Send,
+    Auth,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,6 +41,22 @@ pub enum EventType {
     CoinbaseRewardCredit,
     CoinbaseRewardBurned,
     CoinbaseRewardLocked,
+    // token-send lifecycle (Phase A)
+    TokenSendInscribeAdmitted,
+    TokenSendInscribeRejected,
+    TokenSendDebit,
+    TokenSendCredit,
+    TokenSendSkipped,
+    // token-auth lifecycle (Phase B)
+    TokenAuthCreateInscribed,
+    TokenAuthCreateRegistered,
+    TokenAuthCreateRejected,
+    TokenAuthCancelInscribed,
+    TokenAuthCancelTapped,
+    TokenAuthRedeemDebit,
+    TokenAuthRedeemCredit,
+    TokenAuthRedeemRejected,
+    TokenAuthRedeemSkipped,
 }
 
 impl EventType {
@@ -61,6 +79,20 @@ impl EventType {
             Self::CoinbaseRewardCredit => "coinbase_reward_credit",
             Self::CoinbaseRewardBurned => "coinbase_reward_burned",
             Self::CoinbaseRewardLocked => "coinbase_reward_locked",
+            Self::TokenSendInscribeAdmitted => "token_send_inscribe_admitted",
+            Self::TokenSendInscribeRejected => "token_send_inscribe_rejected",
+            Self::TokenSendDebit => "token_send_debit",
+            Self::TokenSendCredit => "token_send_credit",
+            Self::TokenSendSkipped => "token_send_skipped",
+            Self::TokenAuthCreateInscribed => "token_auth_create_inscribed",
+            Self::TokenAuthCreateRegistered => "token_auth_create_registered",
+            Self::TokenAuthCreateRejected => "token_auth_create_rejected",
+            Self::TokenAuthCancelInscribed => "token_auth_cancel_inscribed",
+            Self::TokenAuthCancelTapped => "token_auth_cancel_tapped",
+            Self::TokenAuthRedeemDebit => "token_auth_redeem_debit",
+            Self::TokenAuthRedeemCredit => "token_auth_redeem_credit",
+            Self::TokenAuthRedeemRejected => "token_auth_redeem_rejected",
+            Self::TokenAuthRedeemSkipped => "token_auth_redeem_skipped",
         }
     }
 }
