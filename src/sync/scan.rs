@@ -1057,15 +1057,16 @@ impl Syncer {
         // inscribe new transferables). The flag is auto-set on the
         // first post-941,848 coinbase credit and cleared only by an
         // explicit `unblock-transferables` control op.
-        let avail_snapshot = self.snapshot_available_from(wtx, &transfer_inscribes_unresolved)?;
-        let blocked_senders =
-            self.snapshot_blocked_senders_from(wtx, &transfer_inscribes_unresolved)?;
-        let inscribe_resolutions = resolve_transfer_inscribes(
-            transfer_inscribes_unresolved,
-            &avail_snapshot,
-            &blocked_senders,
-        );
-
+        //
+        // Inscribe resolution itself is deferred to the write phase
+        // (after mints / coinbase / settlements / auth-redeems have
+        // applied). Reading `avail` from a pre-block snapshot causes a
+        // false-negative when the sender was credited earlier in the
+        // same block (e.g. via an auth-redeem or a transfer settlement
+        // at a lower tx_index). ord-tap processes each envelope in
+        // tx-index order and reads the live `b - t`, so same-block
+        // credits do count.
+        //
         // Resolve mints per ticker, threading the cumulative-issued
         // total so the resolver can clamp against `max_supply` and
         // match ord-tap's `dc/<tick>` tokens-left bookkeeping.
@@ -1102,94 +1103,13 @@ impl Syncer {
         // (Deploys are not auto-registered — v0.1.0 indexes only the
         // NAT deployment, which is seeded at startup.)
 
-        // 2. Transfer inscribes
-        for r in inscribe_resolutions {
-            match r {
-                InscribeResolution::Admitted {
-                    inscription_id,
-                    ticker,
-                    address,
-                    amount,
-                    inscribed_height,
-                    tx_index,
-                } => {
-                    {
-                        let mut table = wtx.open_table(VALID_TRANSFERS)?;
-                        let v = ValidTransfer {
-                            ticker: ticker.clone(),
-                            sender: address.as_str().to_string(),
-                            amount,
-                            inscribed_height,
-                            consumed_height: None,
-                        };
-                        table.insert(inscription_id.as_str(), encode(&v)?.as_slice())?;
-                    }
-                    // Maintain `transferables_by_sender` so
-                    // `/wallets/:addr/transferables` can range-scan
-                    // instead of full-table scan.
-                    {
-                        let mut idx = wtx.open_table(TRANSFERABLES_BY_SENDER)?;
-                        idx.insert(
-                            (ticker.as_str(), address.as_str(), inscription_id.as_str()),
-                            1u8,
-                        )?;
-                    }
-                    let a = i128::try_from(amount).unwrap_or(i128::MAX);
-                    apply_wallet_delta(&wtx, &ticker, address.as_str(), 0, -a, a, 0, occurred_at)?;
-                    events.push(self.new_event(
-                        &ticker,
-                        EventFamily::Transfer,
-                        EventType::TokenTransferInscribeAdmitted,
-                        block,
-                        occurred_at,
-                        Some(tx_index),
-                        Some(inscription_id),
-                        Some(address.as_str().to_string()),
-                        None,
-                        EventDelta {
-                            delta_available: -a,
-                            delta_transferable: a,
-                            ..Default::default()
-                        },
-                        serde_json::json!({ "amount": amount.to_string() }),
-                        &block_hash,
-                    ));
-                }
-                InscribeResolution::Skipped {
-                    inscription_id,
-                    ticker,
-                    address,
-                    attempted_amount,
-                    snapshot_available,
-                    inscribed_height: _,
-                    tx_index,
-                    reason,
-                } => {
-                    events.push(self.new_event(
-                        &ticker,
-                        EventFamily::Transfer,
-                        EventType::TokenTransferSkippedSemantic,
-                        block,
-                        occurred_at,
-                        Some(tx_index),
-                        Some(inscription_id),
-                        Some(address.as_str().to_string()),
-                        None,
-                        EventDelta::default(),
-                        // u128/i128 don't round-trip through serde_json's
-                        // number type (capped at i64/u64/f64). Serialize
-                        // as decimal strings to preserve range for pathological
-                        // `amt` values that fit u128 but overflow u64.
-                        serde_json::json!({
-                            "amount": attempted_amount.to_string(),
-                            "available": snapshot_available.to_string(),
-                            "reason": reason,
-                        }),
-                        &block_hash,
-                    ));
-                }
-            }
-        }
+        // (Transfer-inscribe resolution moved below the settlement /
+        //  mint / coinbase / auth-redeem phases so it reads the LIVE
+        //  post-those-events wallet state, matching ord-tap's
+        //  tx-index-ordered traversal. Same-block credits via a
+        //  transfer-settle, token-send-execute, auth-redeem, mint, or
+        //  coinbase at a lower tx_index now count toward the
+        //  inscribing wallet's available balance.)
 
         // 2b. Token-send reveals: register pending_sends rows + emit
         //     TokenSendInscribeAdmitted. Balance movement happens later
@@ -1554,6 +1474,103 @@ impl Syncer {
                     // owner column cleared above, no ledger event needed.
                     // For send/auth pending rows, we leave them in-place
                     // as unconsumed; a later reorg can still clean up.
+                }
+            }
+        }
+
+        // 6b. Transfer inscribes (MOVED from block-entry to here so
+        //     the resolver sees the live post-settlement wallet state.
+        //     Mirrors ord-tap's tx-index-ordered traversal where an
+        //     inscribe at tx_index N sees credits/debits from all
+        //     prior tx_indices in the same block. Within this resolver,
+        //     candidates are still sorted by inscription_number so two
+        //     inscribes from the same sender in the same block resolve
+        //     in the canonical order with a running balance.)
+        let avail_snapshot = self.snapshot_available_from(wtx, &transfer_inscribes_unresolved)?;
+        let blocked_senders =
+            self.snapshot_blocked_senders_from(wtx, &transfer_inscribes_unresolved)?;
+        let inscribe_resolutions = resolve_transfer_inscribes(
+            transfer_inscribes_unresolved,
+            &avail_snapshot,
+            &blocked_senders,
+        );
+        for r in inscribe_resolutions {
+            match r {
+                InscribeResolution::Admitted {
+                    inscription_id,
+                    ticker,
+                    address,
+                    amount,
+                    inscribed_height,
+                    tx_index,
+                } => {
+                    {
+                        let mut table = wtx.open_table(VALID_TRANSFERS)?;
+                        let v = ValidTransfer {
+                            ticker: ticker.clone(),
+                            sender: address.as_str().to_string(),
+                            amount,
+                            inscribed_height,
+                            consumed_height: None,
+                        };
+                        table.insert(inscription_id.as_str(), encode(&v)?.as_slice())?;
+                    }
+                    {
+                        let mut idx = wtx.open_table(TRANSFERABLES_BY_SENDER)?;
+                        idx.insert(
+                            (ticker.as_str(), address.as_str(), inscription_id.as_str()),
+                            1u8,
+                        )?;
+                    }
+                    let a = i128::try_from(amount).unwrap_or(i128::MAX);
+                    apply_wallet_delta(&wtx, &ticker, address.as_str(), 0, -a, a, 0, occurred_at)?;
+                    events.push(self.new_event(
+                        &ticker,
+                        EventFamily::Transfer,
+                        EventType::TokenTransferInscribeAdmitted,
+                        block,
+                        occurred_at,
+                        Some(tx_index),
+                        Some(inscription_id),
+                        Some(address.as_str().to_string()),
+                        None,
+                        EventDelta {
+                            delta_available: -a,
+                            delta_transferable: a,
+                            ..Default::default()
+                        },
+                        serde_json::json!({ "amount": amount.to_string() }),
+                        &block_hash,
+                    ));
+                }
+                InscribeResolution::Skipped {
+                    inscription_id,
+                    ticker,
+                    address,
+                    attempted_amount,
+                    snapshot_available,
+                    inscribed_height: _,
+                    tx_index,
+                    reason,
+                } => {
+                    events.push(self.new_event(
+                        &ticker,
+                        EventFamily::Transfer,
+                        EventType::TokenTransferSkippedSemantic,
+                        block,
+                        occurred_at,
+                        Some(tx_index),
+                        Some(inscription_id),
+                        Some(address.as_str().to_string()),
+                        None,
+                        EventDelta::default(),
+                        serde_json::json!({
+                            "amount": attempted_amount.to_string(),
+                            "available": snapshot_available.to_string(),
+                            "reason": reason,
+                        }),
+                        &block_hash,
+                    ));
                 }
             }
         }
