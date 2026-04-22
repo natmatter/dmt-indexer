@@ -77,7 +77,7 @@ pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> = TableDefinition::
 /// Mirrors ord-tap's `Vec<(sequence_number, satpoint_offset)>` shape in
 /// `UtxoEntry::parse_inscriptions`.
 pub const INSCRIPTION_OWNERS: MultimapTableDefinition<'static, &str, &[u8]> =
-    MultimapTableDefinition::new("inscription_owners_v2");
+    MultimapTableDefinition::new("inscription_owners");
 
 /// Daily per-deployment rollups: key = (ticker, day_bucket_be_u32), value = JSON DailyStats.
 pub const DAILY_STATS: TableDefinition<'static, (&str, u32), &[u8]> =
