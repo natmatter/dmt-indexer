@@ -557,7 +557,23 @@ impl Syncer {
                 // batch reveals with distinct recipient outputs this is
                 // material; previously we always used vout 0 and misattributed
                 // envelopes past the first.
-                let landing_vout = pe.env_pos as usize;
+                // Ord places all inscriptions of a reveal tx at vout 0
+                // by default — each inscription's sat flows to the
+                // first output unless the envelope carries an OP_2
+                // `pointer` tag (which TAP/DMT payloads do not use).
+                // We previously set this to `pe.env_pos`, which broke
+                // multi-inscription txs: i1 credited the change output
+                // instead of the inscriber, and i2+ dropped entirely
+                // when env_pos exceeded the tx's vout count. Real-
+                // world impact was large — ~490 missing dmt-mint
+                // credits across the cascade-tree trace.
+                //
+                // For the small minority of reveals that do use
+                // pointers or multi-input sat tracking, a follow-up
+                // should implement ord's full sat-flow logic; that
+                // edge case does not affect current NAT data.
+                let landing_vout = 0usize;
+                let _ = pe.env_pos; // kept for future use in sat-tracking
                 let to_addr = txv.tx.output.get(landing_vout).and_then(|o| {
                     if o.script_pubkey.is_op_return() {
                         None
