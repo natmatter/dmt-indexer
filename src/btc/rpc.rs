@@ -129,12 +129,59 @@ impl RpcClient {
     }
 
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, params: Value) -> Result<T> {
+        // Retry on transient transport errors (timeouts, connection
+        // resets). bitcoind shares its RPC thread pool with every
+        // other consumer on the node (ordsigil-tx, wallets, block
+        // explorers) — a short timeout under load shouldn't kill the
+        // whole sync process. JSON-RPC-level errors (bitcoind returned
+        // a code) are NOT retried because the same bad input will
+        // produce the same error.
+        const ATTEMPTS: u32 = 4;
+        let mut delay = Duration::from_millis(500);
+        let mut last_transport_err: Option<reqwest::Error> = None;
+        for attempt in 0..ATTEMPTS {
+            match self.call_once::<T>(method, &params).await {
+                Ok(v) => return Ok(v),
+                // Retry transient HTTP errors.
+                Err(Error::Http(e)) => {
+                    let is_transient =
+                        e.is_timeout() || e.is_connect() || e.is_request() || e.is_body();
+                    if !is_transient || attempt + 1 == ATTEMPTS {
+                        return Err(Error::Http(e));
+                    }
+                    warn!(
+                        method,
+                        attempt = attempt + 1,
+                        ?delay,
+                        error = %e,
+                        "bitcoind JSON-RPC transient error — retrying"
+                    );
+                    last_transport_err = Some(e);
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+                // Non-transient errors propagate immediately.
+                Err(e) => return Err(e),
+            }
+        }
+        // Unreachable because the loop either returns or sleeps; keep
+        // a defensive return so the signature stays honest.
+        Err(last_transport_err
+            .map(Error::Http)
+            .unwrap_or_else(|| Error::Rpc(format!("{method}: exhausted retries"))))
+    }
+
+    async fn call_once<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<T> {
         let (user, pass) = self.userpass()?;
         let req = RpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method,
-            params,
+            params: params.clone(),
         };
         let resp = self
             .http
