@@ -4,7 +4,7 @@
 //! stored block_hash does not match the node's hash at that height,
 //! we rewind `finality_depth + 1` blocks and replay forward.
 
-use redb::ReadableTable;
+use redb::{ReadableMultimapTable, ReadableTable};
 use tracing::{info, warn};
 
 use crate::btc::RpcClient;
@@ -331,14 +331,14 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
         }
     }
     {
-        let mut io = tx.open_table(INSCRIPTION_OWNERS)?;
+        let mut io = tx.open_multimap_table(INSCRIPTION_OWNERS)?;
         let keys: Vec<String> = io
             .iter()?
             .filter_map(|r| r.ok())
             .map(|(k, _)| k.value().to_string())
             .collect();
         for k in keys {
-            io.remove(k.as_str())?;
+            io.remove_all(k.as_str())?;
         }
     }
     // Drop per-wallet + global activity feed rows whose recorded event

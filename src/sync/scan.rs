@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use bitcoin::OutPoint;
 use chrono::{DateTime, TimeZone, Utc};
-use redb::ReadableTable;
+use redb::{ReadableMultimapTable, ReadableTable};
 use tokio::sync::broadcast;
 use tokio::sync::Notify;
 use tokio::time::sleep;
@@ -413,7 +413,7 @@ impl Syncer {
         {
             let rtx = self.store.read()?;
             let mut keys = std::collections::HashSet::new();
-            if let Ok(t) = rtx.open_table(INSCRIPTION_OWNERS) {
+            if let Ok(t) = rtx.open_multimap_table(INSCRIPTION_OWNERS) {
                 for r in t.iter()? {
                     if let Ok((k, _)) = r {
                         keys.insert(k.value().to_string());
@@ -489,6 +489,10 @@ impl Syncer {
             global_index: u32,
             /// Position within the tx's envelope list (for within-block rank).
             env_pos: u32,
+            /// OP_2 pointer value if the envelope carried one. None ≡
+            /// default sat-flow (inscription lands at sat 0 of the tx's
+            /// combined output range → vout 0 offset 0).
+            pointer: Option<u64>,
             payload: TapEnvelope,
         }
         struct PreParsedTx {
@@ -515,6 +519,7 @@ impl Syncer {
                         with_payloads.push(ParsedEnvelope {
                             global_index,
                             env_pos: env_pos as u32,
+                            pointer: env.pointer,
                             payload,
                         });
                     }
@@ -550,30 +555,21 @@ impl Syncer {
             // the tracker yet.
             let carriers_before = fresh_carriers.len();
             for pe in &pre.envelopes {
-                // Per ord's default landing rule: envelope K's inscription
-                // sits on the first sat of output K. TAP credits the mint
-                // / carries the transfer to the ADDRESS owning that sat —
-                // which is output K's address, not always output 0. For
-                // batch reveals with distinct recipient outputs this is
-                // material; previously we always used vout 0 and misattributed
-                // envelopes past the first.
-                // Ord places all inscriptions of a reveal tx at vout 0
-                // by default — each inscription's sat flows to the
-                // first output unless the envelope carries an OP_2
-                // `pointer` tag (which TAP/DMT payloads do not use).
-                // We previously set this to `pe.env_pos`, which broke
-                // multi-inscription txs: i1 credited the change output
-                // instead of the inscriber, and i2+ dropped entirely
-                // when env_pos exceeded the tx's vout count. Real-
-                // world impact was large — ~490 missing dmt-mint
-                // credits across the cascade-tree trace.
+                // Ord-tap's default sat-flow: each fresh envelope on
+                // input 0 starts at sat 0 of the tx's output range
+                // (= `total_input_value` at the input-0 boundary =
+                // cumulative input sum before we enter the input loop,
+                // which is 0). A pointer tag reroutes the inscription
+                // to `pointer` if `pointer < total_output_value`.
+                // Ref: ord-tap `index/updater/inscription_updater.rs:458,520-524`.
                 //
-                // For the small minority of reveals that do use
-                // pointers or multi-input sat tracking, a follow-up
-                // should implement ord's full sat-flow logic; that
-                // edge case does not affect current NAT data.
-                let landing_vout = 0usize;
-                let _ = pe.env_pos; // kept for future use in sat-tracking
+                // Resolve that absolute sat offset into `(vout,
+                // offset_in_outpoint)` by walking outputs once.
+                // Without a pointer this is always (0, 0) — same as
+                // the prior default. With a pointer ≥ total_output it
+                // also falls back to (0, 0). Otherwise it routes to
+                // whichever output contains the pointed-at sat.
+                let (landing_vout, landing_offset) = resolve_landing(&txv.tx, pe.pointer);
                 let to_addr = txv.tx.output.get(landing_vout).and_then(|o| {
                     if o.script_pubkey.is_op_return() {
                         None
@@ -689,7 +685,7 @@ impl Syncer {
                                     ticker: tick_canon.clone(),
                                     kind: InscriptionKind::Mint,
                                 },
-                                offset_in_outpoint: 0,
+                                offset_in_outpoint: landing_offset,
                                 outpoint_value_sats: reveal_value,
                             },
                             to_addr.clone(),
@@ -748,7 +744,7 @@ impl Syncer {
                                     ticker: tick_canon.clone(),
                                     kind: InscriptionKind::TokenTransfer,
                                 },
-                                offset_in_outpoint: 0,
+                                offset_in_outpoint: landing_offset,
                                 outpoint_value_sats: reveal_value,
                             },
                             to_addr.clone(),
@@ -816,7 +812,7 @@ impl Syncer {
                                     ticker: "nat".to_string(),
                                     kind: InscriptionKind::TokenSend,
                                 },
-                                offset_in_outpoint: 0,
+                                offset_in_outpoint: landing_offset,
                                 outpoint_value_sats: reveal_value,
                             },
                             to_addr.clone(),
@@ -867,7 +863,7 @@ impl Syncer {
                                             ticker: "nat".to_string(),
                                             kind: InscriptionKind::TokenAuth,
                                         },
-                                        offset_in_outpoint: 0,
+                                        offset_in_outpoint: landing_offset,
                                         outpoint_value_sats: reveal_value,
                                     },
                                     to_addr.clone(),
@@ -918,7 +914,7 @@ impl Syncer {
                                             ticker: "nat".to_string(),
                                             kind: InscriptionKind::TokenAuth,
                                         },
-                                        offset_in_outpoint: 0,
+                                        offset_in_outpoint: landing_offset,
                                         outpoint_value_sats: reveal_value,
                                     },
                                     to_addr.clone(),
@@ -956,7 +952,7 @@ impl Syncer {
                                             ticker: "nat".to_string(),
                                             kind: InscriptionKind::TokenAuth,
                                         },
-                                        offset_in_outpoint: 0,
+                                        offset_in_outpoint: landing_offset,
                                         outpoint_value_sats: reveal_value,
                                     },
                                     to_addr.clone(),
@@ -1005,7 +1001,7 @@ impl Syncer {
                                     ticker: tick_canon.clone(),
                                     kind: InscriptionKind::Control,
                                 },
-                                offset_in_outpoint: 0,
+                                offset_in_outpoint: landing_offset,
                                 outpoint_value_sats: reveal_value,
                             },
                             to_addr.clone(),
@@ -1033,7 +1029,7 @@ impl Syncer {
                 .tx
                 .input
                 .iter()
-                .any(|i| tracker.get(&i.previous_output).is_some());
+                .any(|i| tracker.has(&i.previous_output));
             if spends_tracked {
                 let input_values = self
                     .load_input_values(&txv.tx, &tracker, &block_utxos)
@@ -1742,8 +1738,8 @@ impl Syncer {
 
         for txin in &tx.input {
             let op = txin.previous_output;
-            if let Some(c) = tracker.get(&op) {
-                out.insert(op, c.outpoint_value_sats);
+            if tracker.has(&op) {
+                out.insert(op, tracker.outpoint_value(&op));
                 continue;
             }
             if let Some(vals) = block_utxos.get(&op.txid) {
@@ -1783,36 +1779,43 @@ impl Syncer {
         &self,
         wtx: &redb::WriteTransaction,
     ) -> Result<(InscriptionTracker, std::collections::HashSet<String>)> {
-        let table = wtx.open_table(INSCRIPTION_OWNERS)?;
+        let table = wtx.open_multimap_table(INSCRIPTION_OWNERS)?;
         let mut t = InscriptionTracker::new();
         let mut keys = std::collections::HashSet::new();
         for row in table.iter()? {
-            let (k, v) = row?;
-            let owner: InscriptionOwner = decode(v.value())?;
-            keys.insert(k.value().to_string());
-            let op: OutPoint = match parse_outpoint(&owner.current_outpoint) {
+            let (k, values) = row?;
+            let key_str = k.value().to_string();
+            keys.insert(key_str.clone());
+            let op: OutPoint = match parse_outpoint(&key_str) {
                 Some(op) => op,
                 None => continue,
             };
-            t.insert(
-                op,
-                TrackedCarrier {
-                    inscription: TrackedInscription {
-                        inscription_id: owner.inscription_id.clone(),
-                        ticker: owner.ticker.clone(),
-                        kind: match owner.kind.as_str() {
-                            "token-transfer" => InscriptionKind::TokenTransfer,
-                            "control" => InscriptionKind::Control,
-                            "dmt-mint" => InscriptionKind::Mint,
-                            "token-send" => InscriptionKind::TokenSend,
-                            "token-auth" => InscriptionKind::TokenAuth,
-                            _ => InscriptionKind::Control,
+            // Multimap iter yields (key, MultimapValue) pairs; one
+            // inscription per value. Preserve insertion order when
+            // loading so reveal order is retained in-memory.
+            for v in values {
+                let raw = v?;
+                let owner: InscriptionOwner = decode(raw.value())?;
+                t.insert(
+                    op,
+                    TrackedCarrier {
+                        inscription: TrackedInscription {
+                            inscription_id: owner.inscription_id.clone(),
+                            ticker: owner.ticker.clone(),
+                            kind: match owner.kind.as_str() {
+                                "token-transfer" => InscriptionKind::TokenTransfer,
+                                "control" => InscriptionKind::Control,
+                                "dmt-mint" => InscriptionKind::Mint,
+                                "token-send" => InscriptionKind::TokenSend,
+                                "token-auth" => InscriptionKind::TokenAuth,
+                                _ => InscriptionKind::Control,
+                            },
                         },
+                        offset_in_outpoint: owner.offset_in_outpoint,
+                        outpoint_value_sats: owner.outpoint_value_sats,
                     },
-                    offset_in_outpoint: owner.offset_in_outpoint,
-                    outpoint_value_sats: owner.outpoint_value_sats,
-                },
-            );
+                );
+            }
         }
         Ok((t, keys))
     }
@@ -1888,34 +1891,48 @@ impl Syncer {
         tracker: &InscriptionTracker,
         previous_keys: &std::collections::HashSet<String>,
     ) -> Result<()> {
-        // Delta write: snapshot → diff vs `previous_keys`. Removed keys
-        // are deleted; added/updated keys are written. At steady state
-        // most blocks produce O(1) carrier changes.
-        let mut table = wtx.open_table(INSCRIPTION_OWNERS)?;
-        let current: Vec<(OutPoint, TrackedCarrier)> = tracker_iter(tracker);
-        let mut current_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(current.len());
-        for (op, carrier) in current {
+        // Multimap can't "replace" a key's value-set in-place, so for
+        // every key that still has carriers we `remove_all` then
+        // re-insert the full current set. Keys present before and
+        // absent now get a plain `remove_all`. Re-insertion is cheap
+        // (typically 1–3 values per outpoint) and matches how ord-tap
+        // rewrites the full UtxoEntry on every touch.
+        let mut table = wtx.open_multimap_table(INSCRIPTION_OWNERS)?;
+
+        // Group current state by outpoint-key.
+        let mut by_key: std::collections::HashMap<String, Vec<TrackedCarrier>> =
+            std::collections::HashMap::new();
+        for (op, carrier) in tracker_iter(tracker) {
             let key = format!("{}:{}", op.txid, op.vout);
-            current_keys.insert(key.clone());
-            let v = InscriptionOwner {
-                inscription_id: carrier.inscription.inscription_id.clone(),
-                ticker: carrier.inscription.ticker.clone(),
-                kind: match carrier.inscription.kind {
-                    InscriptionKind::TokenTransfer => "token-transfer".to_string(),
-                    InscriptionKind::Control => "control".to_string(),
-                    InscriptionKind::Mint => "dmt-mint".to_string(),
-                    InscriptionKind::TokenSend => "token-send".to_string(),
-                    InscriptionKind::TokenAuth => "token-auth".to_string(),
-                },
-                current_outpoint: key.clone(),
-                offset_in_outpoint: carrier.offset_in_outpoint,
-                outpoint_value_sats: carrier.outpoint_value_sats,
-            };
-            table.insert(key.as_str(), encode(&v)?.as_slice())?;
+            by_key.entry(key).or_default().push(carrier);
         }
+        let current_keys: std::collections::HashSet<String> = by_key.keys().cloned().collect();
+
+        // Drop removed outpoints entirely.
         for removed in previous_keys.difference(&current_keys) {
-            table.remove(removed.as_str())?;
+            table.remove_all(removed.as_str())?;
+        }
+
+        // For each current key: clear, then re-insert full set.
+        for (key, carriers) in by_key {
+            table.remove_all(key.as_str())?;
+            for carrier in carriers {
+                let v = InscriptionOwner {
+                    inscription_id: carrier.inscription.inscription_id.clone(),
+                    ticker: carrier.inscription.ticker.clone(),
+                    kind: match carrier.inscription.kind {
+                        InscriptionKind::TokenTransfer => "token-transfer".to_string(),
+                        InscriptionKind::Control => "control".to_string(),
+                        InscriptionKind::Mint => "dmt-mint".to_string(),
+                        InscriptionKind::TokenSend => "token-send".to_string(),
+                        InscriptionKind::TokenAuth => "token-auth".to_string(),
+                    },
+                    current_outpoint: key.clone(),
+                    offset_in_outpoint: carrier.offset_in_outpoint,
+                    outpoint_value_sats: carrier.outpoint_value_sats,
+                };
+                table.insert(key.as_str(), encode(&v)?.as_slice())?;
+            }
         }
         Ok(())
     }
@@ -2964,6 +2981,39 @@ fn parse_outpoint(s: &str) -> Option<OutPoint> {
 
 fn tracker_iter(t: &InscriptionTracker) -> Vec<(OutPoint, TrackedCarrier)> {
     t.snapshot()
+}
+
+/// Ord-style landing resolution: given a fresh envelope's optional
+/// pointer, return the `(vout, offset_in_outpoint)` where the
+/// inscription settles. Mirrors ord-tap
+/// `index/updater/inscription_updater.rs:520-632`:
+///
+///   let offset = payload.pointer()
+///       .filter(|&p| p < total_output_value)
+///       .unwrap_or(default_offset /* = total_input_value before our input */);
+///   // then walk outputs accumulating value; land where offset < end.
+///
+/// For fresh inscriptions on input 0 of a reveal tx,
+/// `total_input_value` before input 0 is 0, so the default is sat 0 —
+/// always output 0 at offset 0. A valid pointer reroutes to the sat
+/// it addresses within the combined output range.
+fn resolve_landing(tx: &bitcoin::Transaction, pointer: Option<u64>) -> (usize, u64) {
+    let total_output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let target_sat = match pointer {
+        Some(p) if p < total_output_value => p,
+        _ => 0,
+    };
+    let mut cumulative: u64 = 0;
+    for (vout, o) in tx.output.iter().enumerate() {
+        let v = o.value.to_sat();
+        let end = cumulative.saturating_add(v);
+        if target_sat < end {
+            return (vout, target_sat - cumulative);
+        }
+        cumulative = end;
+    }
+    // Total_output_value == 0 or target_sat == 0 & no outputs.
+    (0, 0)
 }
 
 #[allow(clippy::too_many_arguments)]

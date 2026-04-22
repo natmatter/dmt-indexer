@@ -91,9 +91,15 @@ pub enum BurnReason {
     IntoFees,
 }
 
+/// Multi-valued carrier map: each outpoint can hold N inscriptions
+/// stacked at distinct sat-offsets (ord's `Vec<(sequence_number,
+/// satpoint_offset)>` model in `UtxoEntry::parse_inscriptions`). A
+/// multi-envelope reveal produces multiple carriers at the same
+/// outpoint; each retains its own `offset_in_outpoint` so FIFO
+/// sat-flow routes them correctly when the carrier is spent.
 #[derive(Debug, Default)]
 pub struct InscriptionTracker {
-    by_outpoint: HashMap<OutPoint, TrackedCarrier>,
+    by_outpoint: HashMap<OutPoint, Vec<TrackedCarrier>>,
 }
 
 impl InscriptionTracker {
@@ -101,47 +107,79 @@ impl InscriptionTracker {
         Self::default()
     }
 
+    /// Append a carrier at `outpoint`. Does NOT deduplicate — callers
+    /// supply unique `inscription_id`s and multiple carriers at the
+    /// same satpoint are legitimate (reinscriptions stack).
     pub fn insert(&mut self, outpoint: OutPoint, carrier: TrackedCarrier) {
-        self.by_outpoint.insert(outpoint, carrier);
+        self.by_outpoint.entry(outpoint).or_default().push(carrier);
     }
 
-    pub fn remove(&mut self, outpoint: &OutPoint) -> Option<TrackedCarrier> {
-        self.by_outpoint.remove(outpoint)
+    /// Drain all carriers at `outpoint`. Returns empty Vec if none.
+    pub fn remove(&mut self, outpoint: &OutPoint) -> Vec<TrackedCarrier> {
+        self.by_outpoint.remove(outpoint).unwrap_or_default()
     }
 
-    pub fn get(&self, outpoint: &OutPoint) -> Option<&TrackedCarrier> {
-        self.by_outpoint.get(outpoint)
-    }
-
-    /// Snapshot for persistence.
-    pub fn snapshot(&self) -> Vec<(OutPoint, TrackedCarrier)> {
+    /// All carriers currently at `outpoint` (read-only).
+    pub fn get(&self, outpoint: &OutPoint) -> &[TrackedCarrier] {
         self.by_outpoint
-            .iter()
-            .map(|(op, c)| (*op, c.clone()))
-            .collect()
+            .get(outpoint)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// True if any carrier is present at `outpoint`.
+    pub fn has(&self, outpoint: &OutPoint) -> bool {
+        self.by_outpoint.contains_key(outpoint)
+    }
+
+    /// Total-value-sats reported by the first carrier at `outpoint`
+    /// (all carriers at one outpoint share the same outpoint_value_sats).
+    /// Returns 0 if none.
+    pub fn outpoint_value(&self, outpoint: &OutPoint) -> u64 {
+        self.by_outpoint
+            .get(outpoint)
+            .and_then(|v| v.first())
+            .map(|c| c.outpoint_value_sats)
+            .unwrap_or(0)
+    }
+
+    /// Flat snapshot for persistence — one entry per (outpoint, carrier)
+    /// pair. Ordering within an outpoint is insertion order (stable).
+    pub fn snapshot(&self) -> Vec<(OutPoint, TrackedCarrier)> {
+        let mut out = Vec::new();
+        for (op, carriers) in &self.by_outpoint {
+            for c in carriers {
+                out.push((*op, c.clone()));
+            }
+        }
+        out
     }
 
     /// Process one transaction. `input_values` must map EVERY input
     /// outpoint of `tx` to its value-in-sats (caller fetches via RPC
     /// for non-tracked inputs).
     ///
-    /// Returns the list of moves (or burns) for any inscription this
-    /// tx carried.
+    /// Implements ord's flotsam sat-flow: for each input, collect every
+    /// tracked carrier at that outpoint, compute tx-absolute sat offset
+    /// (`cumulative_input + carrier.offset_in_outpoint`), sort all
+    /// carriers by that offset, then walk outputs once, landing each
+    /// carrier in the output whose sat range contains its offset.
+    /// Matches `ord-tap/src/index/updater/inscription_updater.rs:398-651`.
     pub fn apply_tx(
         &mut self,
         tx: &Transaction,
         input_values: &HashMap<OutPoint, u64>,
     ) -> Vec<TrackerMove> {
         let mut moves = Vec::new();
-        // Collect tracked inscriptions that this tx spends, keyed by
-        // absolute sat offset from the start of the tx's combined
-        // input sat range.
+        // Phase 1: collect all carriers this tx spends, each with its
+        // tx-absolute sat offset.
         let mut cumulative_input: u64 = 0;
         let mut pending: Vec<(OutPoint, TrackedCarrier, u64)> = Vec::new();
         for txin in &tx.input {
             let outpoint = txin.previous_output;
             let value = *input_values.get(&outpoint).unwrap_or(&0);
-            if let Some(carrier) = self.by_outpoint.remove(&outpoint) {
+            let carriers = self.by_outpoint.remove(&outpoint).unwrap_or_default();
+            for carrier in carriers {
                 let abs_offset = cumulative_input.saturating_add(carrier.offset_in_outpoint);
                 pending.push((outpoint, carrier, abs_offset));
             }
@@ -150,63 +188,69 @@ impl InscriptionTracker {
         if pending.is_empty() {
             return moves;
         }
+        // Phase 2: sort by tx-absolute offset (ord does
+        // `floating_inscriptions.sort_by_key(|f| f.offset)`). Stable
+        // sort preserves insertion order for ties — carriers at the
+        // same satpoint retain their reveal order.
+        pending.sort_by(|a, b| a.2.cmp(&b.2));
         let txid = tx.compute_txid();
 
-        // For each tracked inscription spent, find its landing output.
-        for (from, carrier, abs_offset) in pending {
-            let inscription = carrier.inscription;
-            let mut cumulative_output: u64 = 0;
-            let mut landed = false;
-            for (vout, out) in tx.output.iter().enumerate() {
-                let value = out.value.to_sat();
-                if abs_offset < cumulative_output.saturating_add(value) {
-                    let to_offset = abs_offset - cumulative_output;
-                    let to = OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    };
-                    if out.script_pubkey.is_op_return() {
-                        moves.push(TrackerMove::Burned {
-                            inscription: inscription.clone(),
-                            from,
-                            reason: BurnReason::OpReturn,
+        // Phase 3: walk outputs once, landing each pending carrier in
+        // the output whose sat range contains its absolute offset.
+        let mut idx = 0usize;
+        let mut cumulative_output: u64 = 0;
+        for (vout, out) in tx.output.iter().enumerate() {
+            let value = out.value.to_sat();
+            let end = cumulative_output.saturating_add(value);
+            while idx < pending.len() && pending[idx].2 < end {
+                let (from, carrier, abs_offset) = pending[idx].clone();
+                let to_offset = abs_offset - cumulative_output;
+                let to = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                if out.script_pubkey.is_op_return() {
+                    moves.push(TrackerMove::Burned {
+                        inscription: carrier.inscription,
+                        from,
+                        reason: BurnReason::OpReturn,
+                    });
+                } else if let Some(addr) = address_from_script(&out.script_pubkey) {
+                    self.by_outpoint
+                        .entry(to)
+                        .or_default()
+                        .push(TrackedCarrier {
+                            inscription: carrier.inscription.clone(),
+                            offset_in_outpoint: to_offset,
+                            outpoint_value_sats: value,
                         });
-                    } else if let Some(addr) = address_from_script(&out.script_pubkey) {
-                        self.by_outpoint.insert(
-                            to,
-                            TrackedCarrier {
-                                inscription: inscription.clone(),
-                                offset_in_outpoint: to_offset,
-                                outpoint_value_sats: value,
-                            },
-                        );
-                        moves.push(TrackerMove::Moved {
-                            inscription: inscription.clone(),
-                            from,
-                            to,
-                            to_offset,
-                            to_outpoint_value_sats: value,
-                            new_owner_address: Some(addr),
-                        });
-                    } else {
-                        moves.push(TrackerMove::Burned {
-                            inscription: inscription.clone(),
-                            from,
-                            reason: BurnReason::Unaddressable,
-                        });
-                    }
-                    landed = true;
-                    break;
+                    moves.push(TrackerMove::Moved {
+                        inscription: carrier.inscription,
+                        from,
+                        to,
+                        to_offset,
+                        to_outpoint_value_sats: value,
+                        new_owner_address: Some(addr),
+                    });
+                } else {
+                    moves.push(TrackerMove::Burned {
+                        inscription: carrier.inscription,
+                        from,
+                        reason: BurnReason::Unaddressable,
+                    });
                 }
-                cumulative_output = cumulative_output.saturating_add(value);
+                idx += 1;
             }
-            if !landed {
-                moves.push(TrackerMove::Burned {
-                    inscription: inscription.clone(),
-                    from,
-                    reason: BurnReason::IntoFees,
-                });
-            }
+            cumulative_output = end;
+        }
+        // Phase 4: any carrier whose offset ≥ total_output_value fell
+        // into fees → burned to the coinbase per ord.
+        for (from, carrier, _) in pending.into_iter().skip(idx) {
+            moves.push(TrackerMove::Burned {
+                inscription: carrier.inscription,
+                from,
+                reason: BurnReason::IntoFees,
+            });
         }
         moves
     }
@@ -359,6 +403,73 @@ mod tests {
             TrackerMove::Burned { reason, .. } => assert_eq!(*reason, BurnReason::IntoFees),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn multi_value_outpoint_all_carriers_move_together() {
+        // Three-envelope reveal lands all three at (vout=0, offset=0)
+        // per ord. When that outpoint is later spent to a single
+        // output, all three should move to that output — NOT just one.
+        let prev = op(1, 0);
+        let mut t = InscriptionTracker::new();
+        t.insert(prev, carrier("a", 546));
+        t.insert(prev, carrier("b", 546));
+        t.insert(prev, carrier("c", 546));
+        assert_eq!(t.get(&prev).len(), 3);
+
+        let tx = spend_tx(vec![txin(prev)], vec![p2wpkh(546)]);
+        let mut iv = HashMap::new();
+        iv.insert(prev, 546);
+        let moves = t.apply_tx(&tx, &iv);
+        assert_eq!(moves.len(), 3);
+        let landed: Vec<_> = moves
+            .iter()
+            .filter_map(|m| match m {
+                TrackerMove::Moved { inscription, .. } => Some(inscription.inscription_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(landed.contains(&"a"));
+        assert!(landed.contains(&"b"));
+        assert!(landed.contains(&"c"));
+    }
+
+    #[test]
+    fn multi_carrier_split_across_outputs_by_offset() {
+        // Three carriers at distinct offsets 0, 400, 800 in a 1000-sat
+        // outpoint. Output layout: 500, 500. Offsets 0 and 400 land in
+        // output 0; offset 800 lands in output 1 at offset 300.
+        let prev = op(1, 0);
+        let mut t = InscriptionTracker::new();
+        let mut c0 = carrier("a", 1000);
+        c0.offset_in_outpoint = 0;
+        let mut c1 = carrier("b", 1000);
+        c1.offset_in_outpoint = 400;
+        let mut c2 = carrier("c", 1000);
+        c2.offset_in_outpoint = 800;
+        t.insert(prev, c0);
+        t.insert(prev, c1);
+        t.insert(prev, c2);
+
+        let tx = spend_tx(vec![txin(prev)], vec![p2wpkh(500), p2wpkh(500)]);
+        let mut iv = HashMap::new();
+        iv.insert(prev, 1000);
+        let moves = t.apply_tx(&tx, &iv);
+        let by_id: HashMap<&str, (u32, u64)> = moves
+            .iter()
+            .filter_map(|m| match m {
+                TrackerMove::Moved {
+                    inscription,
+                    to,
+                    to_offset,
+                    ..
+                } => Some((inscription.inscription_id.as_str(), (to.vout, *to_offset))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_id.get("a"), Some(&(0, 0)));
+        assert_eq!(by_id.get("b"), Some(&(0, 400)));
+        assert_eq!(by_id.get("c"), Some(&(1, 300)));
     }
 
     #[test]

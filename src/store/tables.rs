@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 #[allow(unused_imports)]
 use redb::ReadableTable;
-use redb::{TableDefinition, WriteTransaction};
+use redb::{MultimapTableDefinition, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -69,10 +69,15 @@ pub const DMT_REWARD_ADDRESSES: TableDefinition<'static, &str, u8> =
 /// field. Mirrors ord-tap's `dc/<tick>` "tokens_left" counter.
 pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("mint_totals");
 
-/// Carrier map: which outpoint currently carries which inscription.
-/// Keyed by `{txid}:{vout}`, value = JSON InscriptionOwner.
-pub const INSCRIPTION_OWNERS: TableDefinition<'static, &str, &[u8]> =
-    TableDefinition::new("inscription_owners");
+/// Carrier map: which outpoint currently carries which inscription(s).
+/// Multimap keyed by `{txid}:{vout}`, values are JSON InscriptionOwner
+/// records. An outpoint with multiple inscriptions (multi-envelope
+/// reveal, reinscription stacks) appears once per inscription with
+/// distinct `offset_in_outpoint` + `inscription_id` on the value side.
+/// Mirrors ord-tap's `Vec<(sequence_number, satpoint_offset)>` shape in
+/// `UtxoEntry::parse_inscriptions`.
+pub const INSCRIPTION_OWNERS: MultimapTableDefinition<'static, &str, &[u8]> =
+    MultimapTableDefinition::new("inscription_owners_v2");
 
 /// Daily per-deployment rollups: key = (ticker, day_bucket_be_u32), value = JSON DailyStats.
 pub const DAILY_STATS: TableDefinition<'static, (&str, u32), &[u8]> =
@@ -142,7 +147,7 @@ pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(MINT_CLAIMS)?;
     let _ = tx.open_table(VALID_TRANSFERS)?;
     let _ = tx.open_table(PENDING_CONTROLS)?;
-    let _ = tx.open_table(INSCRIPTION_OWNERS)?;
+    let _ = tx.open_multimap_table(INSCRIPTION_OWNERS)?;
     let _ = tx.open_table(DAILY_STATS)?;
     let _ = tx.open_table(ACTIVITY_RECENT)?;
     let _ = tx.open_table(WALLET_ACTIVITY)?;

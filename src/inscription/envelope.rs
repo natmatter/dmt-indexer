@@ -21,9 +21,19 @@
 //! protocol ID `"ord"` + content-type `"text/plain"` (or missing) +
 //! content whose JSON starts with `{"p":"tap"` in `protocol::envelope`.
 //!
-//! We do NOT handle:
-//! - pointer fields (`OP_2`) — TAP inscriptions don't use them
-//! - parent/child (`OP_3`, `OP_5`) — not needed for ledger correctness
+//! We handle the envelope tags that affect carrier routing or payload
+//! decoding:
+//! - content-type (tag 1), content-encoding (tag 9): needed to decode
+//!   the body (brotli-encoded JSON for live $NAT).
+//! - pointer (tag 2): reroutes the inscription to a non-default sat
+//!   offset within the reveal tx. Per ord-tap
+//!   `inscriptions/inscription.rs:223` the value is a 0..8 byte
+//!   little-endian u64; values with non-zero bytes past index 8 are
+//!   rejected. Used by
+//!   `index/updater/inscription_updater.rs:520` as:
+//!   `payload.pointer().filter(|p| *p < total_output_value).unwrap_or(offset)`.
+//!   Rarely used by TAP payloads but still applied when present.
+//! - parent/child (`OP_3`, `OP_5`) — not needed for ledger correctness.
 //!
 //! For brotli-decoding of `content_encoding == "br"` payloads see
 //! `decode_content`. The live `$NAT` deploy uses brotli-encoded JSON.
@@ -42,9 +52,11 @@ pub const PROTOCOL_ID: &[u8] = b"ord";
 /// blessed.
 pub const JUBILEE_HEIGHT: u64 = 824_544;
 
-/// Ord envelope tags we care about. NAT uses only content-type and
-/// content-encoding; parent/metadata/delegate/etc. are irrelevant.
+/// Ord envelope tags we care about. NAT uses content-type,
+/// content-encoding, and (rarely) pointer. Parent/metadata/delegate
+/// etc. are irrelevant to TAP ledger routing.
 const TAG_CONTENT_TYPE: u8 = 1;
+const TAG_POINTER: u8 = 2;
 const TAG_CONTENT_ENCODING: u8 = 9;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,6 +73,13 @@ pub struct Envelope {
     pub content: Vec<u8>,
     /// Input index on the reveal tx that carried this envelope.
     pub input_index: u32,
+    /// OP_2 pointer value, decoded as little-endian u64. None when the
+    /// envelope has no pointer tag or the value is malformed (non-zero
+    /// bytes past index 8). Used by the scan loop to route the
+    /// inscription to a non-default sat offset per ord's
+    /// `Inscription::pointer()`.
+    #[serde(default)]
+    pub pointer: Option<u64>,
 }
 
 impl Envelope {
@@ -189,6 +208,7 @@ fn parse_script(script_bytes: &[u8], input_index: u32, global_index: &mut u32) -
         // OP_ENDIF (no body).
         let mut content_type: Option<Vec<u8>> = None;
         let mut content_encoding: Option<Vec<u8>> = None;
+        let mut pointer_bytes: Option<Vec<u8>> = None;
         let mut content: Vec<u8> = Vec::new();
         let mut in_body = false;
         let mut closed = false;
@@ -221,6 +241,7 @@ fn parse_script(script_bytes: &[u8], input_index: u32, global_index: &mut u32) -
                     match tag {
                         TAG_CONTENT_TYPE => content_type = Some(val.as_bytes().to_vec()),
                         TAG_CONTENT_ENCODING => content_encoding = Some(val.as_bytes().to_vec()),
+                        TAG_POINTER => pointer_bytes = Some(val.as_bytes().to_vec()),
                         _ => {}
                     }
                 }
@@ -237,6 +258,7 @@ fn parse_script(script_bytes: &[u8], input_index: u32, global_index: &mut u32) -
         if !closed {
             continue;
         }
+        let pointer = pointer_bytes.as_deref().and_then(decode_pointer_u64);
         let env = Envelope {
             kind: EnvelopeKind::Inscription {
                 index: *global_index,
@@ -245,6 +267,7 @@ fn parse_script(script_bytes: &[u8], input_index: u32, global_index: &mut u32) -
             content_encoding: content_encoding.and_then(|b| String::from_utf8(b).ok()),
             content,
             input_index,
+            pointer,
         };
         *global_index += 1;
         out.push(env);
@@ -267,6 +290,21 @@ fn script_has_envelope_signature(bytes: &[u8]) -> bool {
     // stdlib windows iterator is adequate here because the signature
     // is 6 bytes.
     bytes.windows(SIGNATURE.len()).any(|w| w == SIGNATURE)
+}
+
+/// Decode a pointer payload per ord-tap
+/// `inscriptions/inscription.rs:223`. Up to 8 bytes, little-endian.
+/// Any non-zero byte past index 8 invalidates the pointer (returns
+/// None) — matches ord's strict validity check.
+fn decode_pointer_u64(value: &[u8]) -> Option<u64> {
+    if value.iter().skip(8).copied().any(|b| b != 0) {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    for (i, b) in value.iter().take(8).enumerate() {
+        buf[i] = *b;
+    }
+    Some(u64::from_le_bytes(buf))
 }
 
 fn is_push_0(o: bitcoin::opcodes::Opcode) -> bool {
@@ -335,6 +373,34 @@ mod tests {
         script.extend_from_slice(&[0x00, 0x63, 0x03, b'o', b'r', b'd']);
         script.extend_from_slice(&[0x01, 0x01, 0x68]);
         assert!(script_has_envelope_signature(&script));
+    }
+
+    #[test]
+    fn pointer_decode_empty_is_zero() {
+        assert_eq!(decode_pointer_u64(&[]), Some(0));
+    }
+
+    #[test]
+    fn pointer_decode_little_endian_u64() {
+        // 0x0102 LE == 258
+        assert_eq!(decode_pointer_u64(&[0x02, 0x01]), Some(258));
+        // Max 8-byte LE
+        assert_eq!(decode_pointer_u64(&[0xff; 8]), Some(u64::MAX));
+    }
+
+    #[test]
+    fn pointer_decode_rejects_non_zero_past_byte_8() {
+        let mut v = vec![0u8; 10];
+        v[9] = 1; // non-zero at index 9
+        assert_eq!(decode_pointer_u64(&v), None);
+    }
+
+    #[test]
+    fn pointer_decode_allows_trailing_zero_padding() {
+        // ord accepts values longer than 8 bytes when the extra bytes
+        // are all zero — the prefix must be the u64 LE value.
+        let v = vec![0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode_pointer_u64(&v), Some(5));
     }
 
     #[test]
