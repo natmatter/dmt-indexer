@@ -1379,18 +1379,51 @@ impl Syncer {
             }
         }
 
-        // 5b. Transfer inscribes — admitted here (between credits and
-        //     settlements) so the resolver sees credits applied in
-        //     this block (auth-redeems at 2d, mints at 4, coinbase at
-        //     5), AND so VALID_TRANSFERS / TRANSFERABLES_BY_SENDER are
-        //     written BEFORE step 6's settle_transfer tries to read
-        //     them. Same-block inscribe+spend (a common TAP pattern
-        //     where the reveal and the send live in the same block)
-        //     needs this ordering: the reveal tx's inscribe must
-        //     admit before the spend tx's settlement runs in step 6,
-        //     otherwise the settle silently no-ops (valid_transfer
-        //     missing) and the sender never debits / recipient never
-        //     credits. Mirrors ord-tap's tx-index-ordered traversal.
+        // 5b. Transfer inscribes — admitted between step-5 credits and
+        //     step-6 settlements, using a two-pass settle to handle
+        //     BOTH same-block credit-then-inscribe AND same-block
+        //     inscribe-then-spend ordering at once. Ord-tap processes
+        //     envelopes and moves in tx-index order; a simple "all
+        //     settles before all admits" breaks same-block
+        //     inscribe+spend (settle can't find the just-written
+        //     valid_transfer), and a simple "all admits before all
+        //     settles" breaks credit-then-inscribe (admit can't see
+        //     the yet-to-land credit). Two passes get both:
+        //
+        //       pass 1 (BEFORE admit): settle only the moves whose
+        //           VALID_TRANSFERS already exists at block entry —
+        //           i.e. the inscribe happened in a PRIOR block.
+        //           Credits from these settlements land in
+        //           WALLET_STATE before admission runs.
+        //       step 5b: admit new inscribes against LIVE balance;
+        //           write VALID_TRANSFERS for successes.
+        //       pass 2 (AFTER admit): settle the moves whose
+        //           VALID_TRANSFERS was just written — i.e.
+        //           same-block inscribe+spend.
+        //
+        //     Non-transfer moves (Control / Send / Auth / Mint / Burn)
+        //     all go in pass 1 — they don't gate on VALID_TRANSFERS.
+        let (pass1_moves, pass2_moves) = {
+            let vtable = wtx.open_table(VALID_TRANSFERS)?;
+            let mut p1: Vec<(u32, TrackerMove)> = Vec::with_capacity(moves.len());
+            let mut p2: Vec<(u32, TrackerMove)> = Vec::new();
+            for (tx_index, mv) in moves.drain(..) {
+                let defer = matches!(
+                    &mv,
+                    TrackerMove::Moved { inscription, .. }
+                        if matches!(inscription.kind, InscriptionKind::TokenTransfer)
+                            && vtable.get(inscription.inscription_id.as_str())?.is_none()
+                );
+                if defer {
+                    p2.push((tx_index, mv));
+                } else {
+                    p1.push((tx_index, mv));
+                }
+            }
+            (p1, p2)
+        };
+        // Execute pass 1 (settles with pre-existing VALID_TRANSFERS + all non-transfer moves)
+        self.apply_moves(wtx, pass1_moves, block, occurred_at, &block_hash, &mut events)?;
         let avail_snapshot = self.snapshot_available_from(wtx, &transfer_inscribes_unresolved)?;
         let blocked_senders =
             self.snapshot_blocked_senders_from(wtx, &transfer_inscribes_unresolved)?;
@@ -1480,104 +1513,10 @@ impl Syncer {
             }
         }
 
-        // 6. Apply moves (settle transfers + tap controls + burns)
-        for (_, mv) in moves {
-            // Update INSCRIPTIONS owner + consumed_height.
-            if let Some((insc_id, new_owner, consumed)) = describe_move(&mv, block.height) {
-                let mut table = wtx.open_table(INSCRIPTIONS)?;
-                let existing: Option<InscriptionIndex> = {
-                    let raw = table.get(insc_id.as_str())?;
-                    raw.and_then(|v| decode::<InscriptionIndex>(v.value()).ok())
-                };
-                if let Some(mut ix) = existing {
-                    ix.current_owner_address = new_owner;
-                    if consumed {
-                        ix.consumed_height = Some(block.height);
-                    }
-                    table.insert(insc_id.as_str(), encode(&ix)?.as_slice())?;
-                }
-            }
-            match mv {
-                TrackerMove::Moved {
-                    inscription,
-                    from: _,
-                    to: _,
-                    to_offset: _,
-                    to_outpoint_value_sats: _,
-                    new_owner_address,
-                } => {
-                    match inscription.kind {
-                        InscriptionKind::TokenTransfer => {
-                            self.settle_transfer(
-                                &wtx,
-                                &inscription.ticker,
-                                &inscription.inscription_id,
-                                new_owner_address.as_deref(),
-                                block,
-                                occurred_at,
-                                &block_hash,
-                                &mut events,
-                            )?;
-                        }
-                        InscriptionKind::Control => {
-                            self.tap_control(
-                                &wtx,
-                                &inscription.ticker,
-                                &inscription.inscription_id,
-                                new_owner_address.as_deref(),
-                                block,
-                                occurred_at,
-                                &block_hash,
-                                &mut events,
-                            )?;
-                        }
-                        InscriptionKind::Mint => {
-                            // No ledger effect — the INSCRIPTIONS owner
-                            // column was already refreshed above.
-                        }
-                        InscriptionKind::TokenSend => {
-                            self.settle_token_send(
-                                &wtx,
-                                &inscription.inscription_id,
-                                new_owner_address.as_deref(),
-                                block,
-                                occurred_at,
-                                &block_hash,
-                                &mut events,
-                            )?;
-                        }
-                        InscriptionKind::TokenAuth => {
-                            self.settle_token_auth(
-                                &wtx,
-                                &inscription.inscription_id,
-                                new_owner_address.as_deref(),
-                                block,
-                                occurred_at,
-                                &block_hash,
-                                &mut events,
-                            )?;
-                        }
-                    }
-                }
-                TrackerMove::Burned { inscription, .. } => {
-                    if matches!(inscription.kind, InscriptionKind::TokenTransfer) {
-                        self.burn_transfer(
-                            &wtx,
-                            &inscription.ticker,
-                            &inscription.inscription_id,
-                            block,
-                            occurred_at,
-                            &block_hash,
-                            &mut events,
-                        )?;
-                    }
-                    // Mint / control / token-send / token-auth burns:
-                    // owner column cleared above, no ledger event needed.
-                    // For send/auth pending rows, we leave them in-place
-                    // as unconsumed; a later reorg can still clean up.
-                }
-            }
-        }
+        // 6. Apply pass-2 moves (same-block inscribe+spend whose
+        //    VALID_TRANSFERS was just written in step 5b). Pass-1
+        //    moves were already applied above before admission.
+        self.apply_moves(wtx, pass2_moves, block, occurred_at, &block_hash, &mut events)?;
 
         // 7. Persist inscription index, carrier map, events, rollups
         {
@@ -1953,6 +1892,108 @@ impl Syncer {
                     outpoint_value_sats: carrier.outpoint_value_sats,
                 };
                 table.insert(key.as_str(), encode(&v)?.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a batch of tracker moves. Extracted from the old step-6
+    /// inline loop so it can be called twice (pass 1 before
+    /// transfer-inscribe admission, pass 2 after). Each move updates
+    /// INSCRIPTIONS owner + consumed_height, then dispatches to the
+    /// kind-specific settle handler.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_moves(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        moves: Vec<(u32, TrackerMove)>,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        for (_, mv) in moves {
+            if let Some((insc_id, new_owner, consumed)) = describe_move(&mv, block.height) {
+                let mut table = wtx.open_table(INSCRIPTIONS)?;
+                let existing: Option<InscriptionIndex> = {
+                    let raw = table.get(insc_id.as_str())?;
+                    raw.and_then(|v| decode::<InscriptionIndex>(v.value()).ok())
+                };
+                if let Some(mut ix) = existing {
+                    ix.current_owner_address = new_owner;
+                    if consumed {
+                        ix.consumed_height = Some(block.height);
+                    }
+                    table.insert(insc_id.as_str(), encode(&ix)?.as_slice())?;
+                }
+            }
+            match mv {
+                TrackerMove::Moved {
+                    inscription,
+                    new_owner_address,
+                    ..
+                } => match inscription.kind {
+                    InscriptionKind::TokenTransfer => {
+                        self.settle_transfer(
+                            wtx,
+                            &inscription.ticker,
+                            &inscription.inscription_id,
+                            new_owner_address.as_deref(),
+                            block,
+                            occurred_at,
+                            block_hash,
+                            events,
+                        )?;
+                    }
+                    InscriptionKind::Control => {
+                        self.tap_control(
+                            wtx,
+                            &inscription.ticker,
+                            &inscription.inscription_id,
+                            new_owner_address.as_deref(),
+                            block,
+                            occurred_at,
+                            block_hash,
+                            events,
+                        )?;
+                    }
+                    InscriptionKind::Mint => {}
+                    InscriptionKind::TokenSend => {
+                        self.settle_token_send(
+                            wtx,
+                            &inscription.inscription_id,
+                            new_owner_address.as_deref(),
+                            block,
+                            occurred_at,
+                            block_hash,
+                            events,
+                        )?;
+                    }
+                    InscriptionKind::TokenAuth => {
+                        self.settle_token_auth(
+                            wtx,
+                            &inscription.inscription_id,
+                            new_owner_address.as_deref(),
+                            block,
+                            occurred_at,
+                            block_hash,
+                            events,
+                        )?;
+                    }
+                },
+                TrackerMove::Burned { inscription, .. } => {
+                    if matches!(inscription.kind, InscriptionKind::TokenTransfer) {
+                        self.burn_transfer(
+                            wtx,
+                            &inscription.ticker,
+                            &inscription.inscription_id,
+                            block,
+                            occurred_at,
+                            block_hash,
+                            events,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
