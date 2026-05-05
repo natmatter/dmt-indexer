@@ -34,7 +34,11 @@ pub const DTA_MAX_BYTES: usize = 512;
 pub struct TokenSendItem {
     pub ticker: NormalizedTicker,
     pub recipient: NormalizedAddress,
+    pub recipient_raw: String,
     pub amount: u128,
+    pub amount_raw: String,
+    #[serde(default)]
+    pub amount_was_number: bool,
     /// Opaque metadata — preserved byte-identical for audit trails; not
     /// semantically interpreted by the indexer.
     pub dta: Option<String>,
@@ -86,9 +90,9 @@ fn parse_item(raw: serde_json::Value) -> Result<TokenSendItem> {
         .ok_or_else(|| Error::Protocol("item.address missing".into()))?;
     let recipient = normalize_address(addr_str)
         .ok_or_else(|| Error::Protocol("item.address invalid".into()))?;
-    // `amt` is allowed as string OR number (ord-tap ValueStringifyActivation
-    // rejects numeric forms at/after block 885,588; we defer that gate to
-    // the caller that has the inscribed_height).
+    let amount_was_number = matches!(obj.get("amt"), Some(serde_json::Value::Number(_)));
+    // `amt` is allowed as string OR number before ValueStringifyActivation.
+    // The height gate is enforced in scan.rs, where block height is known.
     let amt_str = match obj.get("amt") {
         None => return Err(Error::Protocol("item.amt missing".into())),
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -109,7 +113,10 @@ fn parse_item(raw: serde_json::Value) -> Result<TokenSendItem> {
     Ok(TokenSendItem {
         ticker,
         recipient,
+        recipient_raw: addr_str.to_string(),
         amount,
+        amount_raw: amt_str,
+        amount_was_number,
         dta,
     })
 }
@@ -150,6 +157,33 @@ mod tests {
     fn bad_address_rejected() {
         let p = br#"{"p":"tap","op":"token-send","items":[{"tick":"dmt-nat","amt":"1","address":"  "}]}"#;
         assert!(parse_send(p).is_err());
+    }
+
+    #[test]
+    fn recipient_is_normalized_before_height_validation() {
+        let p = br#"{"p":"tap","op":"token-send","items":[{"tick":"drk","amt":"200","address":" bc1qx6mz7amgarnljyaqx0qequ77mrq30s23rc0ace"}]}"#;
+        let out = parse_send(p).unwrap();
+        let item = &out.items[0];
+        assert_eq!(
+            item.recipient.as_str(),
+            "bc1qx6mz7amgarnljyaqx0qequ77mrq30s23rc0ace"
+        );
+        assert_eq!(
+            item.recipient_raw,
+            " bc1qx6mz7amgarnljyaqx0qequ77mrq30s23rc0ace"
+        );
+        assert!(
+            crate::protocol::address::is_valid_tap_address_at_height(
+                item.recipient.as_str(),
+                828_413
+            )
+        );
+        assert!(
+            !crate::protocol::address::is_valid_tap_address_at_height(
+                item.recipient_raw.as_str(),
+                828_413
+            )
+        );
     }
 
     #[test]

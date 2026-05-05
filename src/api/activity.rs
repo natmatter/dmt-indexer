@@ -76,7 +76,16 @@ async fn activity_handler(
     let mut page: Vec<LedgerEvent> = Vec::with_capacity(limit);
     let mut total: u64 = 0;
 
-    for row in table.iter().unwrap() {
+    let iter: Box<dyn Iterator<Item = _>> = if let Some(ref wt) = want_ticker {
+        match table.range((wt.as_str(), 0u64, 0u64)..=(wt.as_str(), u64::MAX, u64::MAX)) {
+            Ok(range) => Box::new(range),
+            Err(_) => Box::new(table.iter().unwrap()),
+        }
+    } else {
+        Box::new(table.iter().unwrap())
+    };
+
+    for row in iter {
         let (k, v) = row.unwrap();
         let (t, _, _) = k.value();
         if let Some(ref wt) = want_ticker {

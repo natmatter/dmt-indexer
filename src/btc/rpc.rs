@@ -243,6 +243,26 @@ impl RpcClient {
             .map_err(|e| Error::Rpc(format!("parse bits {bits_hex}: {e}")))
     }
 
+    /// Fetch the header fields DMT element mints can reference.
+    pub async fn get_block_header_fields(&self, height: u64) -> Result<(u32, u32)> {
+        let hash = self.get_block_hash(height).await?;
+        let info: Value = self
+            .call("getblockheader", json!([hash.to_string(), true]))
+            .await?;
+        let bits_hex = info
+            .get("bits")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Rpc("getblockheader: missing bits".into()))?;
+        let bits = u32::from_str_radix(bits_hex, 16)
+            .map_err(|e| Error::Rpc(format!("parse bits {bits_hex}: {e}")))?;
+        let nonce = info
+            .get("nonce")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| Error::Rpc("getblockheader: missing nonce".into()))?;
+        Ok((bits, nonce))
+    }
+
     /// Fetch a block by hash via Bitcoin Core's REST binary endpoint.
     /// Much faster than JSON-RPC because it skips hex encoding, JSON
     /// wrapping, and basic-auth overhead. Requires `rest=1` in

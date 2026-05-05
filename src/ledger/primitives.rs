@@ -3,9 +3,8 @@
 //!
 //! Mirrors ord-tap's `exec_internal_send_one` (`/tmp/ot_mod.rs:290-358`):
 //!
-//! 1. Check `from.available >= amount` (ord-tap computes this as
-//!    `from_balance - from_trf` ≥ `amount`; our `WalletState.available`
-//!    already stores the same quantity directly).
+//! 1. Check `from.total - from.transferable >= amount`, matching
+//!    ord-tap's `from_balance - from_trf` calculation directly.
 //! 2. If `from == to`, return a `Self` outcome — no state mutation.
 //! 3. Else debit sender (available -a, total -a) and credit recipient
 //!    (available +a, total +a).
@@ -56,15 +55,11 @@ pub fn exec_internal_send_one(
     occurred_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<SendOutcome> {
     let amt_i128 = i128::try_from(amount).unwrap_or(i128::MAX);
-    // Read sender available BEFORE self-send check so that self-send on
-    // an insufficient-available sender still reports the right snapshot.
-    let from_available = {
-        let table = wtx.open_table(WALLET_STATE)?;
-        let raw = table.get((ticker, from))?;
-        raw.and_then(|v| decode::<WalletState>(v.value()).ok())
-            .map(|s| s.available)
-            .unwrap_or(0)
-    };
+    // ord-tap does not store "available"; it derives spendable as
+    // `balance - transferable` at execution time. Use the same source
+    // of truth so a stale cached available column cannot reject an
+    // otherwise valid send.
+    let from_available = reconcile_available(wtx, ticker, from, occurred_at)?;
     if from_available < amt_i128 {
         return Ok(SendOutcome::InsufficientAvailable {
             snapshot_available: from_available,
@@ -78,6 +73,30 @@ pub fn exec_internal_send_one(
     // Credit recipient: total +a, available +a.
     apply_wallet_delta(wtx, ticker, to, amt_i128, amt_i128, 0, 0, occurred_at)?;
     Ok(SendOutcome::Sent)
+}
+
+fn reconcile_available(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    address: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<i128> {
+    let mut state: WalletState = {
+        let table = wtx.open_table(WALLET_STATE)?;
+        let raw = table.get((ticker, address))?;
+        raw.and_then(|v| decode(v.value()).ok()).unwrap_or_default()
+    };
+    let spendable = state.total.saturating_sub(state.transferable);
+    if state.available != spendable {
+        state.available = spendable;
+        if state.first_activity.is_none() {
+            state.first_activity = Some(occurred_at);
+        }
+        state.last_activity = Some(occurred_at);
+        let mut table = wtx.open_table(WALLET_STATE)?;
+        table.insert((ticker, address), encode(&state)?.as_slice())?;
+    }
+    Ok(spendable)
 }
 
 /// Lower-level delta application, copied from `scan.rs::apply_wallet_delta`.
@@ -165,12 +184,24 @@ mod tests {
     }
 
     fn seed_balance(db: &Database, ticker: &str, addr: &str, total: i128, available: i128) {
+        seed_state(db, ticker, addr, total, available, 0);
+    }
+
+    fn seed_state(
+        db: &Database,
+        ticker: &str,
+        addr: &str,
+        total: i128,
+        available: i128,
+        transferable: i128,
+    ) {
         let tx = db.begin_write().unwrap();
         {
             let mut table = tx.open_table(WALLET_STATE).unwrap();
             let s = WalletState {
                 total,
                 available,
+                transferable,
                 ..Default::default()
             };
             let bytes = encode(&s).unwrap();
@@ -240,5 +271,16 @@ mod tests {
         let (bt, ba) = read_balance(&db, "nat", "bob");
         assert_eq!(bt, 30);
         assert_eq!(ba, 30);
+    }
+
+    #[test]
+    fn spend_check_derives_available_from_total_minus_transferable() {
+        let db = mk_store();
+        seed_state(&db, "nat", "alice", 100, 0, 10);
+        let tx = db.begin_write().unwrap();
+        let outcome =
+            exec_internal_send_one(&tx, "nat", "alice", "bob", 50, chrono::Utc::now()).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(outcome, SendOutcome::Sent));
     }
 }

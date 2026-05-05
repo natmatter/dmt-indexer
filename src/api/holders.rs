@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::state::AppState;
 use crate::store::codec::decode;
-use crate::store::tables::{WalletState, WALLET_STATE};
+use crate::store::tables::{WalletState, BALANCES_BY_VALUE, WALLET_STATE};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/holders", get(holders_handler))
@@ -52,9 +52,52 @@ async fn holders_handler(
         Ok(t) => t,
         Err(e) => return Json(serde_json::json!({ "error": e.to_string() })).into_response(),
     };
-    let mut rows: Vec<HolderRow> = Vec::new();
     let want_ticker = q.ticker.as_deref().map(str::to_lowercase);
     let search = q.search.as_deref().map(str::to_lowercase);
+
+    if let (Some(ticker), None) = (want_ticker.as_deref(), search.as_deref()) {
+        if let Ok(index) = rtx.open_table(BALANCES_BY_VALUE) {
+            let lo = [0u8; 16];
+            let hi = [0xffu8; 16];
+            let mut total = 0u64;
+            let mut rows: Vec<HolderRow> = Vec::with_capacity(limit as usize);
+            let range =
+                index.range((ticker, lo.as_slice(), "")..=(ticker, hi.as_slice(), "\u{10ffff}"));
+            if let Ok(range) = range {
+                for row in range.flatten() {
+                    let (k, v) = row;
+                    let (_, _, address) = k.value();
+                    total += 1;
+                    if total <= offset as u64 || rows.len() >= limit as usize {
+                        continue;
+                    }
+                    let state: WalletState = table
+                        .get((ticker, address))
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| decode(raw.value()).ok())
+                        .unwrap_or_else(|| WalletState {
+                            total: i128::from(v.value()),
+                            ..Default::default()
+                        });
+                    rows.push(HolderRow {
+                        ticker: ticker.to_string(),
+                        address: address.to_string(),
+                        total: state.total,
+                        available: state.available,
+                        transferable: state.transferable,
+                        transferables_blocked: state.transferables_blocked,
+                    });
+                }
+                return crate::api::activity::response_with_total(
+                    Json(rows).into_response(),
+                    total,
+                );
+            }
+        }
+    }
+
+    let mut rows: Vec<HolderRow> = Vec::new();
     for row in table.iter().unwrap() {
         let (k, v) = row.unwrap();
         let (t, a) = k.value();

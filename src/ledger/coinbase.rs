@@ -1,12 +1,8 @@
 //! Coinbase-reward distribution for NAT (post-885,588).
 //!
-//! Deterministic cumulative-share math mirroring nat-backend
-//! (`crates/nat-core/src/coinbase.rs`). Each output's share is the
-//! delta between its cumulative share and the previous one; the final
-//! output absorbs rounding residual, so `sum(shares) == reward` exactly.
-//!
-//! OP_RETURN / un-addressable outputs still receive a proportional
-//! share — it is recorded as a burn event rather than a wallet credit.
+//! Deterministic per-output floor math mirroring ord-tap. OP_RETURN /
+//! un-addressable coinbase outputs are excluded from both the denominator
+//! and distribution.
 //!
 //! At block ≥ `miner_transfer_activation` new recipients get
 //! `transferables_blocked = true` on their **first** coinbase credit
@@ -27,6 +23,7 @@ pub struct CoinbaseShare {
     pub address: Option<String>,
     pub share_amount: u128,
     pub value_sats: u64,
+    #[allow(dead_code)]
     pub is_burn: bool,
     /// True if this share should set the recipient's
     /// `transferables_blocked` flag (per the miner-lock activation
@@ -50,10 +47,21 @@ pub fn distribute(
     if reward == 0 || coinbase.output.is_empty() {
         return Vec::new();
     }
-    let total_value: u128 = coinbase
+    let eligible: Vec<(u32, String, u64)> = coinbase
         .output
         .iter()
-        .map(|o| u128::from(o.value.to_sat()))
+        .enumerate()
+        .filter_map(|(vout, output)| {
+            if output.script_pubkey.is_op_return() {
+                return None;
+            }
+            let address = address_from_script(&output.script_pubkey)?;
+            Some((vout as u32, address, output.value.to_sat()))
+        })
+        .collect();
+    let total_value: u128 = eligible
+        .iter()
+        .map(|(_, _, value)| u128::from(*value))
         .sum();
     if total_value == 0 {
         return Vec::new();
@@ -64,33 +72,22 @@ pub fn distribute(
         .map(|h| block_height >= h)
         .unwrap_or(false);
 
-    let mut cumulative_value: u128 = 0;
-    let mut cumulative_share: u128 = 0;
-    let mut out = Vec::with_capacity(coinbase.output.len());
-    for (vout, output) in coinbase.output.iter().enumerate() {
-        cumulative_value += u128::from(output.value.to_sat());
-        let next_cumulative_share = reward
-            .checked_mul(cumulative_value)
+    let mut out = Vec::with_capacity(eligible.len());
+    for (vout, address, value_sats) in eligible {
+        let share = reward
+            .checked_mul(u128::from(value_sats))
             .map(|product| product / total_value)
-            .unwrap_or_else(|| {
-                let share = (u128::from(output.value.to_sat()) * reward) / total_value;
-                cumulative_share + share
-            });
-        let share = next_cumulative_share.saturating_sub(cumulative_share);
-        cumulative_share = next_cumulative_share;
+            .unwrap_or_else(|| (u128::from(value_sats) * reward) / total_value);
         if share == 0 {
             continue;
         }
-
-        let address = address_from_script(&output.script_pubkey);
-        let is_burn = output.script_pubkey.is_op_return() || address.is_none();
         out.push(CoinbaseShare {
-            vout: vout as u32,
-            address,
+            vout,
+            address: Some(address),
             share_amount: share,
-            value_sats: output.value.to_sat(),
-            is_burn,
-            should_lock_on_first_credit: miner_locked && !is_burn,
+            value_sats,
+            is_burn: false,
+            should_lock_on_first_credit: miner_locked,
         });
     }
     out
@@ -111,11 +108,15 @@ mod tests {
         Deployment {
             ticker: normalize_ticker("nat").unwrap(),
             deploy_inscription_id: "".into(),
+            dmt: true,
             element_inscription_id: "".into(),
             element_field: ElementField::Bits,
             dt: None,
             dim: None,
             bits_mode: BitsMode::RawHex,
+            decimals: 0,
+            mint_limit: 0,
+            privilege_auth: None,
             activation_height: 817_709,
             coinbase_activation: Some(NAT_COINBASE_ACTIVATION),
             miner_transfer_activation: Some(NAT_MINER_TRANSFER_ACTIVATION),
@@ -168,21 +169,29 @@ mod tests {
     #[test]
     fn sum_equals_reward_exactly() {
         let d = nat_deployment();
-        let t = tx(vec![p2wpkh(333), p2wpkh(667), op_return(1)]);
+        let t = tx(vec![p2wpkh(333), p2wpkh(667)]);
         let shares = distribute(&d, &t, NAT_COINBASE_ACTIVATION, 0x17034220);
         let reward = decode_bits(0x17034220, BitsMode::RawHex).unwrap();
         let sum: u128 = shares.iter().map(|s| s.share_amount).sum();
-        assert_eq!(sum, reward);
+        assert!(sum <= reward);
     }
 
     #[test]
-    fn all_op_return_burns_everything() {
+    fn op_return_outputs_are_excluded() {
+        let d = nat_deployment();
+        let t = tx(vec![op_return(100), p2wpkh(200)]);
+        let shares = distribute(&d, &t, NAT_COINBASE_ACTIVATION, 0x17034220);
+        let reward = decode_bits(0x17034220, BitsMode::RawHex).unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_amount, reward);
+        assert!(!shares[0].is_burn);
+    }
+
+    #[test]
+    fn all_op_return_outputs_produce_no_rewards() {
         let d = nat_deployment();
         let t = tx(vec![op_return(100), op_return(200)]);
-        let shares = distribute(&d, &t, NAT_COINBASE_ACTIVATION, 0x17034220);
-        assert!(!shares.is_empty());
-        assert!(shares.iter().all(|s| s.is_burn));
-        assert!(shares.iter().all(|s| !s.should_lock_on_first_credit));
+        assert!(distribute(&d, &t, NAT_COINBASE_ACTIVATION, 0x17034220).is_empty());
     }
 
     #[test]

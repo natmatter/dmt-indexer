@@ -40,6 +40,44 @@ pub fn normalize_address(raw: &str) -> Option<NormalizedAddress> {
     Some(NormalizedAddress(canonical))
 }
 
+/// ord-tap compatible address gate for payload-recipient fields.
+///
+/// Before TAP_TESTNET_FIX_ACTIVATION_HEIGHT, ord-tap accepts any Bitcoin
+/// network if the address shape is one of the supported script types.
+/// At/after the activation it requires mainnet on mainnet indexing.
+pub fn is_valid_tap_address_at_height(raw: &str, height: u64) -> bool {
+    const TAP_TESTNET_FIX_ACTIVATION_HEIGHT: u64 = 916_233;
+    let Ok(parsed) = raw.parse::<Address<bitcoin::address::NetworkUnchecked>>() else {
+        return false;
+    };
+    let main_ok = parsed.clone().require_network(Network::Bitcoin).is_ok();
+    let any_net_ok = main_ok
+        || parsed.clone().require_network(Network::Testnet).is_ok()
+        || parsed.clone().require_network(Network::Signet).is_ok()
+        || parsed.clone().require_network(Network::Regtest).is_ok();
+    let net_ok = if height < TAP_TESTNET_FIX_ACTIVATION_HEIGHT {
+        any_net_ok
+    } else {
+        main_ok
+    };
+    if !net_ok {
+        return false;
+    }
+    let spk = parsed.assume_checked_ref().script_pubkey();
+    let b = spk.as_bytes();
+    let is_p2wpkh = b.len() == 22 && b[0] == 0x00 && b[1] == 0x14;
+    let is_p2wsh = b.len() == 34 && b[0] == 0x00 && b[1] == 0x20;
+    let is_p2tr = b.len() == 34 && b[0] == 0x51 && b[1] == 0x20;
+    let is_p2pkh = b.len() == 25
+        && b[0] == 0x76
+        && b[1] == 0xa9
+        && b[2] == 0x14
+        && b[23] == 0x88
+        && b[24] == 0xac;
+    let is_p2sh = b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87;
+    is_p2wpkh || is_p2wsh || is_p2tr || is_p2pkh || is_p2sh
+}
+
 fn is_bech32_prefix(address: &str) -> bool {
     let lowered = address.to_ascii_lowercase();
     lowered.starts_with("bc1") || lowered.starts_with("tb1") || lowered.starts_with("bcrt1")

@@ -7,10 +7,10 @@
 //!   OP_FALSE OP_IF
 //!     <"ord">
 //!     OP_1     <content_type>
-//!     OP_11    <metadata>       // optional
-//!     OP_5     <metaprotocol>   // optional
-//!     OP_7     <content_encoding> // optional
-//!     OP_9     <delegate>       // optional
+//!     OP_5     <metadata>       // optional
+//!     OP_7     <metaprotocol>   // optional
+//!     OP_9     <content_encoding> // optional
+//!     OP_11    <delegate>       // optional
 //!     OP_0     <content chunk>*
 //!   OP_ENDIF
 //! ```
@@ -38,10 +38,13 @@
 //! For brotli-decoding of `content_encoding == "br"` payloads see
 //! `decode_content`. The live `$NAT` deploy uses brotli-encoded JSON.
 
+use std::collections::BTreeMap;
+
+use bitcoin::hashes::Hash as _;
 use bitcoin::opcodes::all as op;
 use bitcoin::opcodes::{OP_FALSE, OP_TRUE};
 use bitcoin::script::{Instruction, Script};
-use bitcoin::Transaction;
+use bitcoin::{Transaction, Txid};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_ID: &[u8] = b"ord";
@@ -57,7 +60,13 @@ pub const JUBILEE_HEIGHT: u64 = 824_544;
 /// etc. are irrelevant to TAP ledger routing.
 const TAG_CONTENT_TYPE: u8 = 1;
 const TAG_POINTER: u8 = 2;
+const TAG_PARENT: u8 = 3;
+const TAG_METADATA: u8 = 5;
+const TAG_METAPROTOCOL: u8 = 7;
 const TAG_CONTENT_ENCODING: u8 = 9;
+const TAG_DELEGATE: u8 = 11;
+const TAG_RUNE: u8 = 13;
+const TAG_PROPERTIES: u8 = 17;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EnvelopeKind {
@@ -70,9 +79,18 @@ pub struct Envelope {
     pub kind: EnvelopeKind,
     pub content_type: Option<String>,
     pub content_encoding: Option<String>,
+    /// Ord delegate inscription id, decoded from tag 11 when present.
+    /// A delegated inscription keeps its own inscription id/owner, but
+    /// ord-tap resolves the TAP payload from this delegate content.
+    #[serde(default)]
+    pub delegate: Option<String>,
     pub content: Vec<u8>,
     /// Input index on the reveal tx that carried this envelope.
     pub input_index: u32,
+    /// Envelope offset within the input tapscript. Pre-Jubilee ord curses
+    /// inscriptions whose offset is not zero.
+    #[serde(default)]
+    pub envelope_offset: u32,
     /// OP_2 pointer value, decoded as little-endian u64. None when the
     /// envelope has no pointer tag or the value is malformed (non-zero
     /// bytes past index 8). Used by the scan loop to route the
@@ -80,6 +98,18 @@ pub struct Envelope {
     /// `Inscription::pointer()`.
     #[serde(default)]
     pub pointer: Option<u64>,
+    /// Ord curse metadata. These fields are retained so pre-Jubilee TAP/DMT
+    /// payloads match ord-tap's blessed/cursed split.
+    #[serde(default)]
+    pub duplicate_field: bool,
+    #[serde(default)]
+    pub incomplete_field: bool,
+    #[serde(default)]
+    pub unrecognized_even_field: bool,
+    #[serde(default)]
+    pub pushnum: bool,
+    #[serde(default)]
+    pub stutter: bool,
 }
 
 impl Envelope {
@@ -91,6 +121,20 @@ impl Envelope {
             Some("br") => decompress_brotli(&self.content).unwrap_or_else(|| self.content.clone()),
             _ => self.content.clone(),
         }
+    }
+
+    /// Pre-Jubilee curse tests that are knowable from the envelope itself.
+    /// Reinscription is chain-state dependent and is checked by the scan loop
+    /// against the sat tracker.
+    pub fn is_pre_jubilee_cursed_without_reinscription(&self) -> bool {
+        self.unrecognized_even_field
+            || self.duplicate_field
+            || self.incomplete_field
+            || self.input_index != 0
+            || self.envelope_offset != 0
+            || self.pointer.is_some()
+            || self.pushnum
+            || self.stutter
     }
 }
 
@@ -131,15 +175,13 @@ pub fn parse_envelopes_at_height(tx: &Transaction, block_height: u64) -> Vec<Env
     let mut global_index: u32 = 0;
     for (input_index, txin) in tx.input.iter().enumerate() {
         if let Some(tapscript) = tapscript_from_witness(&txin.witness) {
-            // Cheap pre-filter: the ord envelope opening sequence
-            // begins with `0x00 0x63` (OP_FALSE OP_IF) followed shortly
-            // by the 4-byte push of protocol id "ord" (`0x03 "ord"`).
-            // Scanning for the 5-byte signature takes ~nanoseconds via
-            // memchr and rules out ≥99% of real-world taproot
-            // script-path spends that are not inscriptions. The script
-            // parser is hundreds of ns to microseconds per call, so
-            // this saves a lot on mint-era blocks with many non-ord
-            // taproot inputs.
+            // Cheap pre-filter: ord envelopes begin with OP_FALSE OP_IF,
+            // then a script-level push of protocol id "ord". Do not
+            // require the push to use minimal `PUSH3` encoding here:
+            // ord-tap relies on script instruction parsing and accepts
+            // valid non-minimal pushes such as `OP_PUSHDATA1 03 "ord"`.
+            // This pre-filter must be broad enough to avoid false
+            // negatives; parse_script remains the authoritative check.
             if !script_has_envelope_signature(tapscript) {
                 continue;
             }
@@ -149,13 +191,7 @@ pub fn parse_envelopes_at_height(tx: &Transaction, block_height: u64) -> Vec<Env
         }
     }
     if block_height < JUBILEE_HEIGHT {
-        // Pre-Jubilee cursed rules (simplified to the two that
-        // actually matter for TAP payloads):
-        //   1. An inscription outside input 0 is cursed.
-        //   2. A second+ inscription in the same tx is cursed.
-        // Keep only the first envelope on input 0, if any.
-        out.retain(|e| e.input_index == 0);
-        out.truncate(1);
+        out.retain(|e| !e.is_pre_jubilee_cursed_without_reinscription());
     }
     out
 }
@@ -187,108 +223,206 @@ fn parse_script(script_bytes: &[u8], input_index: u32, global_index: &mut u32) -
     let script = Script::from_bytes(script_bytes);
     let mut out = Vec::new();
     let mut iter = script.instructions().peekable();
+    let mut stuttered = false;
     while iter.peek().is_some() {
         // Look for OP_FALSE OP_IF "ord"
-        match iter.next() {
-            Some(Ok(Instruction::Op(o))) if o == OP_FALSE.into() => {}
-            Some(Ok(Instruction::Op(o))) if is_push_0(o) => {}
-            Some(Ok(Instruction::PushBytes(b))) if b.as_bytes().is_empty() => {}
-            _ => continue,
-        }
-        match iter.next() {
-            Some(Ok(Instruction::Op(o))) if o == op::OP_IF.into() => {}
-            _ => continue,
-        }
-        match iter.next() {
-            Some(Ok(Instruction::PushBytes(b))) if b.as_bytes() == PROTOCOL_ID => {}
-            _ => continue,
-        }
-
-        // Now read tag/value pairs until we hit OP_0 (body start) or
-        // OP_ENDIF (no body).
-        let mut content_type: Option<Vec<u8>> = None;
-        let mut content_encoding: Option<Vec<u8>> = None;
-        let mut pointer_bytes: Option<Vec<u8>> = None;
-        let mut content: Vec<u8> = Vec::new();
-        let mut in_body = false;
-        let mut closed = false;
-        while let Some(inst) = iter.next() {
-            let Ok(inst) = inst else {
-                break;
-            };
-            match inst {
-                Instruction::Op(o) if o == op::OP_ENDIF.into() => {
-                    closed = true;
-                    break;
-                }
-                Instruction::Op(o) if is_push_0(o) => {
-                    in_body = true;
-                }
-                Instruction::PushBytes(b) if b.as_bytes().is_empty() => {
-                    in_body = true;
-                }
-                Instruction::PushBytes(b) if !in_body => {
-                    // Tag: a single-byte push; value: following push.
-                    let tag_bytes = b.as_bytes();
-                    let tag = if tag_bytes.len() == 1 {
-                        tag_bytes[0]
-                    } else {
-                        continue;
-                    };
-                    let Some(Ok(Instruction::PushBytes(val))) = iter.next() else {
-                        continue;
-                    };
-                    match tag {
-                        TAG_CONTENT_TYPE => content_type = Some(val.as_bytes().to_vec()),
-                        TAG_CONTENT_ENCODING => content_encoding = Some(val.as_bytes().to_vec()),
-                        TAG_POINTER => pointer_bytes = Some(val.as_bytes().to_vec()),
-                        _ => {}
-                    }
-                }
-                Instruction::PushBytes(b) if in_body => {
-                    content.extend_from_slice(b.as_bytes());
-                }
-                Instruction::Op(o) if in_body && pushnum_to_int(o).is_some() => {
-                    // OP_1..OP_16 inside body are treated as byte
-                    // values per ord. Not used by TAP; skip.
-                }
-                _ => {}
-            }
-        }
-        if !closed {
+        let Some(Ok(inst)) = iter.next() else {
+            continue;
+        };
+        if !is_empty_push_instruction(&inst) {
             continue;
         }
-        let pointer = pointer_bytes.as_deref().and_then(decode_pointer_u64);
-        let env = Envelope {
-            kind: EnvelopeKind::Inscription {
-                index: *global_index,
-            },
-            content_type: content_type.and_then(|b| String::from_utf8(b).ok()),
-            content_encoding: content_encoding.and_then(|b| String::from_utf8(b).ok()),
-            content,
+        let (next_stuttered, env) = parse_envelope_from_instructions(
+            &mut iter,
             input_index,
-            pointer,
-        };
-        *global_index += 1;
-        out.push(env);
+            out.len() as u32,
+            stuttered,
+            global_index,
+        );
+        if let Some(env) = env {
+            out.push(env);
+            stuttered = false;
+        } else {
+            stuttered = next_stuttered;
+        }
     }
     out
 }
 
+fn parse_envelope_from_instructions<'a, I>(
+    iter: &mut std::iter::Peekable<I>,
+    input_index: u32,
+    envelope_offset: u32,
+    stutter: bool,
+    global_index: &mut u32,
+) -> (bool, Option<Envelope>)
+where
+    I: Iterator<Item = Result<Instruction<'a>, bitcoin::script::Error>>,
+{
+    if !accept_next_op(iter, op::OP_IF.into()) {
+        return (peek_is_empty_push(iter), None);
+    }
+    if !accept_protocol_id(iter) {
+        return (peek_is_empty_push(iter), None);
+    }
+
+    let mut payload: Vec<Vec<u8>> = Vec::new();
+    let mut pushnum = false;
+    loop {
+        let Some(inst) = iter.next() else {
+            return (false, None);
+        };
+        let Ok(inst) = inst else {
+            return (false, None);
+        };
+        match inst {
+            Instruction::Op(o) if o == op::OP_ENDIF.into() => {
+                let env = envelope_from_payload(
+                    input_index,
+                    envelope_offset,
+                    stutter,
+                    pushnum,
+                    payload,
+                    global_index,
+                );
+                return (false, Some(env));
+            }
+            Instruction::Op(o) if is_push_0(o) => payload.push(Vec::new()),
+            Instruction::Op(o) if o == op::OP_PUSHNUM_NEG1.into() => {
+                pushnum = true;
+                payload.push(vec![0x81]);
+            }
+            Instruction::Op(o) if pushnum_to_int(o).is_some() => {
+                pushnum = true;
+                payload.push(vec![pushnum_to_int(o).unwrap()]);
+            }
+            Instruction::PushBytes(b) => payload.push(b.as_bytes().to_vec()),
+            _ => return (false, None),
+        }
+    }
+}
+
+fn envelope_from_payload(
+    input_index: u32,
+    envelope_offset: u32,
+    stutter: bool,
+    pushnum: bool,
+    payload: Vec<Vec<u8>>,
+    global_index: &mut u32,
+) -> Envelope {
+    let body = payload
+        .iter()
+        .enumerate()
+        .position(|(i, push)| i % 2 == 0 && push.is_empty());
+    let mut fields: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut incomplete_field = false;
+    for item in payload[..body.unwrap_or(payload.len())].chunks(2) {
+        match item {
+            [key, value] => fields.entry(key.clone()).or_default().push(value.clone()),
+            _ => incomplete_field = true,
+        }
+    }
+    let duplicate_field = fields.values().any(|values| values.len() > 1);
+
+    let content_encoding = take_field(&mut fields, TAG_CONTENT_ENCODING, false);
+    let content_type = take_field(&mut fields, TAG_CONTENT_TYPE, false);
+    let delegate_bytes = take_field(&mut fields, TAG_DELEGATE, false);
+    let pointer_bytes = take_field(&mut fields, TAG_POINTER, false);
+    let _metadata = take_field(&mut fields, TAG_METADATA, true);
+    let _metaprotocol = take_field(&mut fields, TAG_METAPROTOCOL, false);
+    let _parents = take_array_field(&mut fields, TAG_PARENT);
+    let _properties = take_field(&mut fields, TAG_PROPERTIES, true);
+    let _rune = take_field(&mut fields, TAG_RUNE, false);
+
+    let unrecognized_even_field = fields
+        .keys()
+        .any(|tag| tag.first().map(|lsb| lsb % 2 == 0).unwrap_or_default());
+    let content = body
+        .map(|i| payload[i + 1..].iter().flatten().copied().collect())
+        .unwrap_or_default();
+    let pointer = pointer_bytes.as_deref().and_then(decode_pointer_u64);
+    let env = Envelope {
+        kind: EnvelopeKind::Inscription {
+            index: *global_index,
+        },
+        content_type: content_type.and_then(|b| String::from_utf8(b).ok()),
+        content_encoding: content_encoding.and_then(|b| String::from_utf8(b).ok()),
+        delegate: delegate_bytes
+            .as_deref()
+            .and_then(decode_inscription_id_value),
+        content,
+        input_index,
+        envelope_offset,
+        pointer,
+        duplicate_field,
+        incomplete_field,
+        unrecognized_even_field,
+        pushnum,
+        stutter,
+    };
+    *global_index += 1;
+    env
+}
+
+fn take_field(
+    fields: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    tag: u8,
+    chunked: bool,
+) -> Option<Vec<u8>> {
+    let key = vec![tag];
+    if chunked {
+        fields
+            .remove(&key)
+            .map(|values| values.into_iter().flatten().collect())
+    } else {
+        let values = fields.get_mut(&key)?;
+        if values.is_empty() {
+            None
+        } else {
+            let value = values.remove(0);
+            if values.is_empty() {
+                fields.remove(&key);
+            }
+            Some(value)
+        }
+    }
+}
+
+fn take_array_field(fields: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, tag: u8) -> Vec<Vec<u8>> {
+    fields.remove(&vec![tag]).unwrap_or_default()
+}
+
+fn decode_inscription_id_value(value: &[u8]) -> Option<String> {
+    if value.len() < 32 || value.len() > 36 {
+        return None;
+    }
+    let (txid_bytes, index_bytes) = value.split_at(32);
+    if let Some(last) = index_bytes.last() {
+        if index_bytes.len() != 4 && *last == 0 {
+            return None;
+        }
+    }
+    let txid = Txid::from_slice(txid_bytes).ok()?;
+    let index = [
+        index_bytes.first().copied().unwrap_or_default(),
+        index_bytes.get(1).copied().unwrap_or_default(),
+        index_bytes.get(2).copied().unwrap_or_default(),
+        index_bytes.get(3).copied().unwrap_or_default(),
+    ];
+    Some(format!("{}i{}", txid, u32::from_le_bytes(index)))
+}
+
 /// Fast pre-filter: return true if the script *could* contain an
-/// ord envelope. Looks for the 6-byte opening sequence
-/// `0x00 0x63 0x03 b'o' b'r' b'd'` (OP_FALSE OP_IF PUSH3 "ord").
+/// ord envelope. Looks for the script envelope opener
+/// `0x00 0x63` (OP_FALSE OP_IF).
 ///
 /// This is a pure byte-scan with no script parsing. False positives
 /// (scripts containing the sequence as non-envelope data) are fine —
 /// the real parser will reject them cheaply. False negatives would
 /// silently drop valid inscriptions, so the signature MUST match
-/// every valid ord envelope produced by ord ≥ 0.14.
+/// every script form ord-tap's instruction parser can accept.
 fn script_has_envelope_signature(bytes: &[u8]) -> bool {
-    const SIGNATURE: &[u8] = &[0x00, 0x63, 0x03, b'o', b'r', b'd'];
-    // `memchr::memmem` would be slightly faster but adds a dep; the
-    // stdlib windows iterator is adequate here because the signature
-    // is 6 bytes.
+    const SIGNATURE: &[u8] = &[0x00, 0x63];
     bytes.windows(SIGNATURE.len()).any(|w| w == SIGNATURE)
 }
 
@@ -311,6 +445,47 @@ fn is_push_0(o: bitcoin::opcodes::Opcode) -> bool {
     o == OP_FALSE.into() || o == bitcoin::opcodes::OP_0.into()
 }
 
+fn is_empty_push_instruction(inst: &Instruction<'_>) -> bool {
+    match inst {
+        Instruction::Op(o) => is_push_0(*o),
+        Instruction::PushBytes(b) => b.as_bytes().is_empty(),
+    }
+}
+
+fn accept_next_op<'a, I>(
+    iter: &mut std::iter::Peekable<I>,
+    opcode: bitcoin::opcodes::Opcode,
+) -> bool
+where
+    I: Iterator<Item = Result<Instruction<'a>, bitcoin::script::Error>>,
+{
+    if matches!(iter.peek(), Some(Ok(Instruction::Op(o))) if *o == opcode) {
+        let _ = iter.next();
+        true
+    } else {
+        false
+    }
+}
+
+fn accept_protocol_id<'a, I>(iter: &mut std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = Result<Instruction<'a>, bitcoin::script::Error>>,
+{
+    if matches!(iter.peek(), Some(Ok(Instruction::PushBytes(b))) if b.as_bytes() == PROTOCOL_ID) {
+        let _ = iter.next();
+        true
+    } else {
+        false
+    }
+}
+
+fn peek_is_empty_push<'a, I>(iter: &mut std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = Result<Instruction<'a>, bitcoin::script::Error>>,
+{
+    matches!(iter.peek(), Some(Ok(inst)) if is_empty_push_instruction(inst))
+}
+
 fn pushnum_to_int(o: bitcoin::opcodes::Opcode) -> Option<u8> {
     let v = o.to_u8();
     if (op::OP_PUSHNUM_1.to_u8()..=op::OP_PUSHNUM_16.to_u8()).contains(&v) {
@@ -329,6 +504,20 @@ mod tests {
 
     fn hexstr(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()
+    }
+
+    fn script_with_payload(payload_script: &[u8]) -> Vec<u8> {
+        let mut script = vec![0x00, 0x63, 0x03, b'o', b'r', b'd'];
+        script.extend_from_slice(payload_script);
+        script.push(0x68);
+        script
+    }
+
+    fn parse_one_script(script: &[u8]) -> Envelope {
+        let mut global_index = 0;
+        let envs = parse_script(script, 0, &mut global_index);
+        assert_eq!(envs.len(), 1);
+        envs.into_iter().next().unwrap()
     }
 
     #[test]
@@ -362,6 +551,14 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_accepts_non_minimal_protocol_push() {
+        // ord-tap accepts this as PushBytes("ord"). The fast path must
+        // not reject it before the instruction parser sees it.
+        let script: &[u8] = &[0x00, 0x63, 0x4c, 0x03, b'o', b'r', b'd', 0x68];
+        assert!(script_has_envelope_signature(script));
+    }
+
+    #[test]
     fn fast_path_rejects_random_script() {
         let script: &[u8] = &[0x51, 0x02, 0xff, 0xaa, 0x63, 0x01, 0x75];
         assert!(!script_has_envelope_signature(script));
@@ -373,6 +570,31 @@ mod tests {
         script.extend_from_slice(&[0x00, 0x63, 0x03, b'o', b'r', b'd']);
         script.extend_from_slice(&[0x01, 0x01, 0x68]);
         assert!(script_has_envelope_signature(&script));
+    }
+
+    #[test]
+    fn parse_envelopes_accepts_non_minimal_protocol_push() {
+        let script = vec![
+            0x00, 0x63, 0x4c, 0x03, b'o', b'r', b'd', 0x00, 0x01, b'x', 0x68,
+        ];
+        let mut witness = bitcoin::Witness::new();
+        witness.push([0x01]);
+        witness.push(script);
+        witness.push([0xc0]);
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness,
+            }],
+            output: vec![],
+        };
+        let envs = parse_envelopes(&tx);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].content.as_slice(), b"x");
     }
 
     #[test]
@@ -401,6 +623,60 @@ mod tests {
         // are all zero — the prefix must be the u64 LE value.
         let v = vec![0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(decode_pointer_u64(&v), Some(5));
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_duplicate_field_curse() {
+        // tag 1/value "a", tag 1/value "b", body "x"
+        let script = script_with_payload(&[
+            0x01, 0x01, 0x01, b'a', 0x01, 0x01, 0x01, b'b', 0x00, 0x01, b'x',
+        ]);
+        let env = parse_one_script(&script);
+        assert!(env.duplicate_field);
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_unrecognized_even_field_curse() {
+        // tag 4 is not an ord-recognized tag and has an even low byte.
+        let script = script_with_payload(&[0x01, 0x04, 0x01, b'a', 0x00, 0x01, b'x']);
+        let env = parse_one_script(&script);
+        assert!(env.unrecognized_even_field);
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_incomplete_field_curse() {
+        let script = script_with_payload(&[0x01, 0x01]);
+        let env = parse_one_script(&script);
+        assert!(env.incomplete_field);
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_pointer_curse() {
+        // Pointer tag with empty value decodes as pointer 0.
+        let script = script_with_payload(&[0x01, 0x02, 0x00, 0x00, 0x01, b'x']);
+        let env = parse_one_script(&script);
+        assert_eq!(env.pointer, Some(0));
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_pushnum_curse() {
+        let script = script_with_payload(&[op::OP_PUSHNUM_1.to_u8(), 0x01, b'a', 0x00]);
+        let env = parse_one_script(&script);
+        assert!(env.pushnum);
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
+    }
+
+    #[test]
+    fn parser_preserves_pre_jubilee_stutter_curse() {
+        let mut script = vec![0x00];
+        script.extend_from_slice(&script_with_payload(&[0x00, 0x01, b'x']));
+        let env = parse_one_script(&script);
+        assert!(env.stutter);
+        assert!(env.is_pre_jubilee_cursed_without_reinscription());
     }
 
     #[test]

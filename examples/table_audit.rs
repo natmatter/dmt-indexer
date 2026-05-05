@@ -2,7 +2,7 @@ use dmt_indexer::ledger::deploy::Deployment;
 use dmt_indexer::store::codec::decode;
 use dmt_indexer::store::tables::*;
 use dmt_indexer::store::Store;
-use redb::ReadableTable;
+use redb::{ReadableMultimapTable, ReadableTable};
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +29,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(0)
         };
     }
+    macro_rules! mcnt {
+        ($def:expr) => {
+            rtx.open_multimap_table($def)
+                .map(|t| {
+                    let mut n = 0u64;
+                    for row in t.iter().unwrap() {
+                        if let Ok((_, values)) = row {
+                            for _ in values {
+                                n += 1
+                            }
+                        }
+                    }
+                    n
+                })
+                .unwrap_or(0)
+        };
+    }
     println!("  meta                {}", cnt!(META));
     println!("  deployments         {}", cnt!(DEPLOYMENTS));
     println!("  events              {}", cnt!(EVENTS));
@@ -37,24 +54,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  mint_claims         {}", cnt!(MINT_CLAIMS));
     println!("  valid_transfers     {}", cnt!(VALID_TRANSFERS));
     println!("  pending_controls    {}", cnt!(PENDING_CONTROLS));
-    println!("  inscription_owners  {}", cnt!(INSCRIPTION_OWNERS));
+    if std::env::var_os("SKIP_OWNERS").is_some() {
+        println!("  inscription_owners  (skipped)");
+    } else {
+        println!("  inscription_owners  {}", mcnt!(INSCRIPTION_OWNERS));
+    }
     println!("  daily_stats         {}", cnt!(DAILY_STATS));
     println!("  activity_recent     {}", cnt!(ACTIVITY_RECENT));
     println!("  wallet_activity     {}", cnt!(WALLET_ACTIVITY));
     println!("  inscriptions        {}", cnt!(INSCRIPTIONS));
     println!("  stats               {}", cnt!(STATS));
+    println!("  pending_trades      {}", cnt!(PENDING_TRADES));
+    println!("  trade_locks         {}", cnt!(TRADE_LOCKS));
+    println!("  trade_offers        {}", cnt!(TRADE_OFFERS));
 
     println!("\n=== deployment rows ===");
     let t = rtx.open_table(DEPLOYMENTS)?;
     for r in t.iter()? {
         let (k, v) = r?;
         let d: Deployment = decode(v.value())?;
-        println!("  {}: bits_mode={} elem={:?} dt={:?} activation={} coinbase_act={:?} miner_tx_act={:?}",
-            k.value(), d.bits_mode.as_str(), d.element_field, d.dt,
+        println!("  {}: dmt={} dec={} lim={} max={} bits_mode={} elem={:?} dt={:?} activation={} coinbase_act={:?} miner_tx_act={:?}",
+            k.value(), d.dmt, d.decimals, d.mint_limit, d.max_supply,
+            d.bits_mode.as_str(), d.element_field, d.dt,
             d.activation_height, d.coinbase_activation, d.miner_transfer_activation);
     }
 
     drop(rtx);
+    if std::env::var_os("SKIP_INVARIANTS").is_some() {
+        return Ok(());
+    }
     println!("\n=== invariants ===");
     let violations = dmt_indexer::verify::check_invariants(&store)?;
     if violations.is_empty() {

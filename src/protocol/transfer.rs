@@ -11,6 +11,9 @@ use crate::protocol::ticker::{normalize_ticker, NormalizedTicker};
 pub struct TokenTransferPayload {
     pub ticker: NormalizedTicker,
     pub amount: u128,
+    pub amount_raw: String,
+    #[serde(default)]
+    pub amount_was_number: bool,
 }
 
 pub fn parse_transfer(payload: &[u8]) -> Result<TokenTransferPayload> {
@@ -23,9 +26,15 @@ pub fn parse_transfer(payload: &[u8]) -> Result<TokenTransferPayload> {
     }
     let tick = take_string(&mut body, "tick")?;
     let ticker = normalize_ticker(&tick)?;
+    let amount_was_number = matches!(body.get("amt"), Some(serde_json::Value::Number(_)));
     let amt = take_numeric_string(&mut body, "amt")?;
     let amount = parse_amount(&amt)?;
-    Ok(TokenTransferPayload { ticker, amount })
+    Ok(TokenTransferPayload {
+        ticker,
+        amount,
+        amount_raw: amt,
+        amount_was_number,
+    })
 }
 
 #[cfg(test)]

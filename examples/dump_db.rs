@@ -4,7 +4,7 @@
 
 use std::env;
 
-use redb::{Database, ReadableTable};
+use redb::{Database, ReadableMultimapTable, ReadableTable};
 
 use dmt_indexer::ledger::deploy::Deployment;
 use dmt_indexer::ledger::event::LedgerEvent;
@@ -149,19 +149,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n== inscription_owners ==");
     {
-        let t = rtx.open_table(INSCRIPTION_OWNERS)?;
+        let t = rtx.open_multimap_table(INSCRIPTION_OWNERS)?;
         let mut n = 0;
         for r in t.iter()? {
-            let (k, v) = r?;
-            let o: InscriptionOwner = decode(v.value())?;
-            println!(
-                "  {} => insc={} ticker={} kind={}",
-                k.value(),
-                o.inscription_id,
-                o.ticker,
-                o.kind
-            );
-            n += 1;
+            let (k, values) = r?;
+            for v in values {
+                let v = v?;
+                let o: InscriptionOwner = decode(v.value())?;
+                println!(
+                    "  {} => insc={} ticker={} kind={} offset={} rank={}",
+                    k.value(),
+                    o.inscription_id,
+                    o.ticker,
+                    o.kind,
+                    o.offset_in_outpoint,
+                    o.sequence_rank
+                );
+                n += 1;
+            }
         }
         println!("  ({} rows)", n);
     }

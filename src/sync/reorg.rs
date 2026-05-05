@@ -12,11 +12,15 @@ use crate::error::Result;
 use crate::ledger::event::LedgerEvent;
 use crate::store::codec::{decode, encode, inverted_balance};
 use crate::store::tables::{
-    cursor_get, cursor_set, Cursor, MintClaim, PendingAuth, PendingSend, ValidTransfer,
-    WalletState, ACTIVITY_RECENT, BALANCES_BY_VALUE, DAILY_ACTIVE_ADDRESSES, DAILY_STATS, EVENTS,
-    INSCRIPTION_OWNERS, MINT_CLAIMS, PENDING_AUTHS, PENDING_CONTROLS, PENDING_SENDS,
-    TOKEN_AUTH_CANCELS, TOKEN_AUTH_RECORDS, TOKEN_AUTH_SIG_REPLAY, TRANSFERABLES_BY_SENDER,
-    VALID_TRANSFERS, WALLET_ACTIVITY, WALLET_STATE,
+    cursor_get, cursor_set, Cursor, MintClaim, PendingAuth, PendingPrivilegeAuth, PendingSend,
+    PendingTrade, ValidTransfer, WalletState, ACTIVITY_RECENT, BALANCES_BY_VALUE,
+    DAILY_ACTIVE_ADDRESSES, DAILY_STATS, DMT_DEPLOY_BY_INSCRIPTION, DMT_ELEMENTS,
+    DMT_ELEMENT_BY_INSCRIPTION, DMT_ELEMENT_SIGNATURES, DMT_MINT_BLOCKS, EVENTS, EVENTS_BY_ID,
+    INSCRIPTION_OWNERS, MINT_CLAIMS, PENDING_AUTHS, PENDING_CONTROLS, PENDING_PRIVILEGE_AUTHS,
+    PENDING_SENDS, PENDING_TRADES, PRIVILEGE_AUTH_CANCELS, PRIVILEGE_AUTH_RECORDS,
+    PRIVILEGE_AUTH_SIG_REPLAY, TOKEN_AUTH_CANCELS, TOKEN_AUTH_RECORDS, TOKEN_AUTH_SIG_REPLAY,
+    TRADE_LOCKS, TRADE_OFFERS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS, WALLET_ACTIVITY,
+    WALLET_STATE,
 };
 use crate::store::Store;
 
@@ -71,6 +75,7 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
     // completes in < 1 second.
     {
         let mut events = tx.open_table(EVENTS)?;
+        let mut events_by_id = tx.open_table(EVENTS_BY_ID)?;
         let to_delete: Vec<(String, u64)> = events
             .iter()?
             .filter_map(|r| r.ok())
@@ -86,6 +91,7 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
             .collect();
         for (t, id) in to_delete {
             events.remove((t.as_str(), id))?;
+            events_by_id.remove(id)?;
         }
     }
     {
@@ -193,6 +199,21 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
         for k in to_delete {
             pc.remove(k.as_str())?;
         }
+        let all: Vec<(String, crate::store::tables::PendingControl)> = pc
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let id = k.value().to_string();
+                let row: crate::store::tables::PendingControl = decode(v.value()).ok()?;
+                Some((id, row))
+            })
+            .collect();
+        for (id, mut row) in all {
+            if matches!(row.consumed_height, Some(ch) if ch > height) {
+                row.consumed_height = None;
+                pc.insert(id.as_str(), encode(&row)?.as_slice())?;
+            }
+        }
     }
     // 1c. PENDING_SENDS: rewind analogous to VALID_TRANSFERS.
     //     Delete rows whose inscribed_height > height; for surviving
@@ -238,7 +259,53 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
             }
         }
     }
-    // 1e. Truncate replay-derived auth tables; they're rebuilt from
+    // 1e. PENDING_TRADES and active trade indexes.
+    {
+        let mut pt = tx.open_table(PENDING_TRADES)?;
+        let all: Vec<(String, PendingTrade)> = pt
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let id = k.value().to_string();
+                let row: PendingTrade = decode(v.value()).ok()?;
+                Some((id, row))
+            })
+            .collect();
+        for (id, mut row) in all {
+            if row.inscribed_height > height {
+                pt.remove(id.as_str())?;
+            } else if matches!(row.consumed_height, Some(ch) if ch > height) {
+                row.consumed_height = None;
+                pt.insert(id.as_str(), encode(&row)?.as_slice())?;
+            }
+        }
+    }
+    {
+        let mut locks = tx.open_table(TRADE_LOCKS)?;
+        let keys: Vec<String> = locks
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            locks.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut offers = tx.open_table(TRADE_OFFERS)?;
+        let keys: Vec<(String, String)> = offers
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| {
+                let (trade, ticker) = k.value();
+                (trade.to_string(), ticker.to_string())
+            })
+            .collect();
+        for (trade, ticker) in keys {
+            offers.remove((trade.as_str(), ticker.as_str()))?;
+        }
+    }
+    // 1f. Truncate replay-derived auth tables; they're rebuilt from
     //     TokenAuth* events below.
     {
         let mut t = tx.open_table(TOKEN_AUTH_RECORDS)?;
@@ -264,6 +331,124 @@ pub fn rewind_cursor(store: &Store, height: u64) -> Result<()> {
     }
     {
         let mut t = tx.open_table(TOKEN_AUTH_SIG_REPLAY)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut p = tx.open_table(PENDING_PRIVILEGE_AUTHS)?;
+        let all: Vec<(String, PendingPrivilegeAuth)> = p
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let id = k.value().to_string();
+                let row: PendingPrivilegeAuth = decode(v.value()).ok()?;
+                Some((id, row))
+            })
+            .collect();
+        for (id, mut row) in all {
+            if row.inscribed_height > height {
+                p.remove(id.as_str())?;
+            } else if matches!(row.consumed_height, Some(ch) if ch > height) {
+                row.consumed_height = None;
+                p.insert(id.as_str(), encode(&row)?.as_slice())?;
+            }
+        }
+    }
+    {
+        let mut t = tx.open_table(PRIVILEGE_AUTH_RECORDS)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(PRIVILEGE_AUTH_CANCELS)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(PRIVILEGE_AUTH_SIG_REPLAY)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(DMT_MINT_BLOCKS)?;
+        let keys: Vec<(String, u64)> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| {
+                let (ticker, blk) = k.value();
+                (ticker.to_string(), blk)
+            })
+            .collect();
+        for (ticker, blk) in keys {
+            t.remove((ticker.as_str(), blk))?;
+        }
+    }
+    {
+        let mut t = tx.open_table(DMT_ELEMENTS)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let rec: crate::store::tables::DmtElementRecord = decode(v.value()).ok()?;
+                if rec.inscribed_height > height {
+                    Some(k.value().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(DMT_ELEMENT_BY_INSCRIPTION)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(DMT_ELEMENT_SIGNATURES)?;
+        let keys: Vec<String> = t
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect();
+        for k in keys {
+            t.remove(k.as_str())?;
+        }
+    }
+    {
+        let mut t = tx.open_table(DMT_DEPLOY_BY_INSCRIPTION)?;
         let keys: Vec<String> = t
             .iter()?
             .filter_map(|r| r.ok())

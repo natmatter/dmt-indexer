@@ -17,15 +17,19 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let existed = path.as_ref().exists();
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
         let db = Database::create(path)?;
-        // Initialise all tables so downstream reads cannot fail on
-        // a cold DB.
-        let tx = db.begin_write()?;
-        tables::init_all(&tx)?;
-        tx.commit()?;
+        // Initialise all tables on a cold DB. On an existing large redb,
+        // opening every table in a write transaction can dominate startup;
+        // normal read paths already handle missing optional indexes.
+        if !existed {
+            let tx = db.begin_write()?;
+            tables::init_all(&tx)?;
+            tx.commit()?;
+        }
         Ok(Self { db: Arc::new(db) })
     }
 

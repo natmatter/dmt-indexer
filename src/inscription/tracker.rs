@@ -31,6 +31,12 @@ pub struct TrackedInscription {
     pub inscription_id: String,
     pub ticker: String,
     pub kind: InscriptionKind,
+    /// Monotonic creation rank used to break ties when multiple
+    /// inscriptions sit on the same sat. ord-tap sorts by internal
+    /// sequence_number before moving flotsam; this preserves that rule
+    /// across redb persistence.
+    #[serde(default)]
+    pub sequence_rank: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -51,6 +57,12 @@ pub enum InscriptionKind {
     /// so the auth inscription's `INSCRIPTIONS` row updates on later
     /// transfers.
     TokenAuth,
+    /// `token-trade` inscriptions. Tracked to execute side-0 offer/cancel
+    /// and side-1 fill on first transfer.
+    TokenTrade,
+    /// `privilege-auth` inscriptions. Tracked to activate/cancel an
+    /// authority on first transfer, matching ord-tap accumulators.
+    PrivilegeAuth,
 }
 
 /// Full-fidelity carrier record: the inscription + where in its
@@ -88,7 +100,7 @@ pub enum TrackerMove {
 pub enum BurnReason {
     OpReturn,
     Unaddressable,
-    IntoFees,
+    IntoFees { fee_offset: u64 },
 }
 
 /// Multi-valued carrier map: each outpoint can hold N inscriptions
@@ -130,6 +142,20 @@ impl InscriptionTracker {
     /// True if any carrier is present at `outpoint`.
     pub fn has(&self, outpoint: &OutPoint) -> bool {
         self.by_outpoint.contains_key(outpoint)
+    }
+
+    /// True if a tracked, accepted inscription occupies exactly this sat
+    /// offset in `outpoint`. Used to mirror ord's pre-Jubilee reinscription
+    /// curse check before a new payload is admitted.
+    pub fn has_at_offset(&self, outpoint: &OutPoint, offset_in_outpoint: u64) -> bool {
+        self.by_outpoint
+            .get(outpoint)
+            .map(|carriers| {
+                carriers
+                    .iter()
+                    .any(|carrier| carrier.offset_in_outpoint == offset_in_outpoint)
+            })
+            .unwrap_or(false)
     }
 
     /// Total-value-sats reported by the first carrier at `outpoint`
@@ -188,11 +214,13 @@ impl InscriptionTracker {
         if pending.is_empty() {
             return moves;
         }
-        // Phase 2: sort by tx-absolute offset (ord does
-        // `floating_inscriptions.sort_by_key(|f| f.offset)`). Stable
-        // sort preserves insertion order for ties — carriers at the
-        // same satpoint retain their reveal order.
-        pending.sort_by(|a, b| a.2.cmp(&b.2));
+        // Phase 2: sort by tx-absolute offset, then by creation rank
+        // for ties. ord-tap inserts same-sat inscriptions as flotsam in
+        // sequence_number order before `sort_by_key(offset)`, so equal
+        // offsets retain sequence order.
+        pending.sort_by_key(|(_, carrier, abs_offset)| {
+            (*abs_offset, carrier.inscription.sequence_rank)
+        });
         let txid = tx.compute_txid();
 
         // Phase 3: walk outputs once, landing each pending carrier in
@@ -245,11 +273,13 @@ impl InscriptionTracker {
         }
         // Phase 4: any carrier whose offset ≥ total_output_value fell
         // into fees → burned to the coinbase per ord.
-        for (from, carrier, _) in pending.into_iter().skip(idx) {
+        for (from, carrier, abs_offset) in pending.into_iter().skip(idx) {
             moves.push(TrackerMove::Burned {
                 inscription: carrier.inscription,
                 from,
-                reason: BurnReason::IntoFees,
+                reason: BurnReason::IntoFees {
+                    fee_offset: abs_offset.saturating_sub(cumulative_output),
+                },
             });
         }
         moves
@@ -302,19 +332,26 @@ mod tests {
         }
     }
 
-    fn opreturn() -> TxOut {
-        TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from(vec![0x6a]),
-        }
-    }
-
     fn carrier(id: &str, value: u64) -> TrackedCarrier {
         TrackedCarrier {
             inscription: TrackedInscription {
                 inscription_id: id.into(),
                 ticker: "nat".into(),
                 kind: InscriptionKind::TokenTransfer,
+                sequence_rank: 0,
+            },
+            offset_in_outpoint: 0,
+            outpoint_value_sats: value,
+        }
+    }
+
+    fn ranked_carrier(id: &str, value: u64, sequence_rank: u64) -> TrackedCarrier {
+        TrackedCarrier {
+            inscription: TrackedInscription {
+                inscription_id: id.into(),
+                ticker: "nat".into(),
+                kind: InscriptionKind::TokenTransfer,
+                sequence_rank,
             },
             offset_in_outpoint: 0,
             outpoint_value_sats: value,
@@ -326,6 +363,8 @@ mod tests {
         let prev = op(1, 0);
         let mut t = InscriptionTracker::new();
         t.insert(prev, carrier("a", 546));
+        assert!(t.has_at_offset(&prev, 0));
+        assert!(!t.has_at_offset(&prev, 1));
         let tx = spend_tx(vec![txin(prev)], vec![p2wpkh(546)]);
         let mut iv = HashMap::new();
         iv.insert(prev, 546);
@@ -400,7 +439,9 @@ mod tests {
         iv.insert(prev, 1000);
         let moves = t.apply_tx(&tx, &iv);
         match &moves[0] {
-            TrackerMove::Burned { reason, .. } => assert_eq!(*reason, BurnReason::IntoFees),
+            TrackerMove::Burned { reason, .. } => {
+                assert_eq!(*reason, BurnReason::IntoFees { fee_offset: 400 })
+            }
             _ => panic!(),
         }
     }
@@ -432,6 +473,29 @@ mod tests {
         assert!(landed.contains(&"a"));
         assert!(landed.contains(&"b"));
         assert!(landed.contains(&"c"));
+    }
+
+    #[test]
+    fn same_sat_ties_sort_by_sequence_rank() {
+        let prev = op(1, 0);
+        let mut t = InscriptionTracker::new();
+        // Insert in reverse creation order. ord-tap sorts same-offset
+        // flotsam by sequence number before applying sat-flow.
+        t.insert(prev, ranked_carrier("newer", 546, 20));
+        t.insert(prev, ranked_carrier("older", 546, 10));
+
+        let tx = spend_tx(vec![txin(prev)], vec![p2wpkh(546)]);
+        let mut iv = HashMap::new();
+        iv.insert(prev, 546);
+        let moves = t.apply_tx(&tx, &iv);
+        let landed: Vec<_> = moves
+            .iter()
+            .filter_map(|m| match m {
+                TrackerMove::Moved { inscription, .. } => Some(inscription.inscription_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(landed, vec!["older", "newer"]);
     }
 
     #[test]

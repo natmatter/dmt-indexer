@@ -20,32 +20,46 @@ use tracing::{debug, info};
 use crate::btc::{BlockView, RpcClient};
 use crate::config::Config;
 use crate::error::Result;
+use crate::inscription::envelope::{Envelope, JUBILEE_HEIGHT};
 use crate::inscription::tracker::{
-    InscriptionKind, InscriptionTracker, TrackedCarrier, TrackedInscription, TrackerMove,
+    BurnReason, InscriptionKind, InscriptionTracker, TrackedCarrier, TrackedInscription,
+    TrackerMove,
 };
 use crate::ledger::coinbase::distribute;
 use crate::ledger::deploy::Deployment;
 use crate::ledger::event::{EventDelta, EventFamily, EventType, LedgerEvent};
 use crate::ledger::mint::{resolve_mints, MintCandidate};
 use crate::ledger::transfer::{
-    resolve_transfer_inscribes, InscribeResolution, TransferInscribeCandidate,
+    resolve_transfer_inscribes, InscribeResolution, TransferBalanceSnapshot,
+    TransferInscribeCandidate,
 };
-use crate::protocol::address::{address_from_script, normalize_address};
+use crate::protocol::address::{
+    address_from_script, is_valid_tap_address_at_height, normalize_address,
+};
 use crate::protocol::auth::TokenAuthForm;
 use crate::protocol::control::ControlOp;
-use crate::protocol::envelope::{decode_tap_payload, TapEnvelope};
+use crate::protocol::element::{DmtElementPayload, ElementField};
+use crate::protocol::envelope::{
+    decode_tap_payload_at_height, tap_compatible_content_type, TapEnvelope,
+};
+use crate::protocol::privilege::PrivilegeAuthForm;
+use crate::protocol::ticker::ticker_is_valid_at_height;
+use crate::protocol::token::{parse_scaled_u128, MAX_DEC_U64_STR};
+use crate::protocol::trade::TokenTradePayload;
 use crate::store::codec::{decode, encode};
 use crate::store::tables::{
     self, cursor_get, cursor_set, Cursor, DailyStats, InscriptionIndex, InscriptionOwner,
     MintClaim, PendingControl as StoredPendingControl, ValidTransfer, WalletState, ACTIVITY_RECENT,
-    DAILY_STATS, DEPLOYMENTS, DMT_REWARD_ADDRESSES, EVENTS, INSCRIPTIONS, INSCRIPTION_OWNERS,
-    MINT_CLAIMS, MINT_TOTALS, PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER, VALID_TRANSFERS,
-    WALLET_ACTIVITY, WALLET_STATE,
+    DAILY_STATS, DEPLOYMENTS, DMT_REWARD_ADDRESSES, EVENTS, EVENTS_BY_ID, INSCRIPTIONS,
+    INSCRIPTION_OWNERS, MINT_CLAIMS, MINT_TOTALS, PENDING_CONTROLS, STATS, TRANSFERABLES_BY_SENDER,
+    VALID_TRANSFERS, WALLET_ACTIVITY, WALLET_STATE,
 };
 use crate::store::Store;
 use crate::sync::reorg::{detect_reorg, rewind_cursor};
 
 pub type EventBus = Arc<broadcast::Sender<LedgerEvent>>;
+
+const TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT: u64 = 885_588;
 
 #[derive(Clone)]
 pub struct SyncHandle {
@@ -64,26 +78,16 @@ pub struct Syncer {
     /// Bounded cache of block height → bits, avoiding redundant RPC
     /// fetches when many mints reference the same prior block.
     bits_cache: HashMap<u64, u32>,
-    /// In-memory tracker state carried across blocks within a commit
-    /// batch. Reloaded from redb on every commit boundary (where
-    /// persisted state and in-memory state are in sync).
+    /// In-memory tracker state carried across commit batches. It is
+    /// reloaded from redb only on startup or after a rewind.
     tracker: Option<InscriptionTracker>,
-    /// Snapshot of the carrier-map keys at the start of the commit
-    /// batch. At commit time, we diff against this set to know which
-    /// outpoints to remove from the persisted INSCRIPTION_OWNERS.
-    tracker_baseline_keys: std::collections::HashSet<String>,
+    /// Outpoints whose carrier set changed in the current commit batch.
+    /// Persist only these keys instead of rewriting the full carrier map.
+    tracker_dirty_keys: HashSet<String>,
     /// Count of blocks applied in the current (uncommitted) batch.
     pending_blocks: u64,
     /// Events queued for broadcast after commit.
     pending_broadcasts: Vec<LedgerEvent>,
-}
-
-#[allow(dead_code)]
-struct TransferInscribe {
-    inscription_id: String,
-    ticker: String,
-    address: String,
-    amount: u128,
 }
 
 struct ControlInscribe {
@@ -93,11 +97,41 @@ struct ControlInscribe {
     op: ControlOp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct TapOrderKey {
+    tx_index: u32,
+    landing_vout: u32,
+    landing_offset: u64,
+    phase: u8,
+    rank: i64,
+}
+
+impl TapOrderKey {
+    fn new(tx_index: u32, landing_vout: u32, landing_offset: u64, phase: u8, rank: i64) -> Self {
+        Self {
+            tx_index,
+            landing_vout,
+            landing_offset,
+            phase,
+            rank,
+        }
+    }
+}
+
+struct DmtElementReveal {
+    inscription_id: String,
+    owner: String,
+    txid: String,
+    landing_vout: u32,
+    payload: DmtElementPayload,
+}
+
 struct PendingSendReveal {
     inscription_id: String,
     creator: String,
     tx_index: u32,
-    items: Vec<crate::store::tables::PendingSendItem>,
+    event_ticker: String,
+    payload: crate::protocol::send::TokenSendPayload,
 }
 
 struct PendingAuthReveal {
@@ -107,14 +141,88 @@ struct PendingAuthReveal {
     form: crate::store::tables::PendingAuthForm,
 }
 
+struct TokenDeployReveal {
+    inscription_id: String,
+    tx_index: u32,
+    owner: String,
+    payload: crate::protocol::token::TokenDeployPayload,
+}
+
+struct TokenMintReveal {
+    inscription_id: String,
+    tx_index: u32,
+    owner: String,
+    payload: crate::protocol::token::TokenMintPayload,
+}
+
+struct DmtDeployReveal {
+    inscription_id: String,
+    owner: String,
+    payload: crate::protocol::deploy::DeployPayload,
+}
+
+struct DmtMintReveal {
+    inscription_id: String,
+    owner: String,
+    payload: crate::protocol::mint::MintPayload,
+    referenced_bits: u32,
+    referenced_nonce: u32,
+    blk_repr: String,
+}
+
+struct PendingTradeReveal {
+    inscription_id: String,
+    creator: String,
+    tx_index: u32,
+    payload: TokenTradePayload,
+}
+
+struct PendingPrivilegeAuthReveal {
+    inscription_id: String,
+    creator: String,
+    form: crate::store::tables::PendingPrivilegeAuthForm,
+}
+
 /// Redeems execute at reveal time (unlike create/cancel which settle at
 /// move). Carries the fully-parsed payload plus tx_index + inscriber
 /// owner address.
 struct AuthRedeemReveal {
     inscription_id: String,
     tx_index: u32,
+    landing_vout: u32,
+    landing_offset: u64,
+    rank: i64,
     inscriber_addr: String,
     payload: crate::protocol::auth::TokenAuthRedeem,
+}
+
+struct OrderedTransferInscribe {
+    inscription_id: String,
+    inscription_number: i64,
+    inscribed_block_height: u64,
+    ticker: String,
+    raw_ticker: String,
+    address: crate::protocol::address::NormalizedAddress,
+    amount_raw: String,
+    tx_index: u32,
+    landing_vout: u32,
+    landing_offset: u64,
+}
+
+enum OrderedTapOp {
+    Move { tx_index: u32, mv: TrackerMove },
+    DmtElement(TapOrderKey, DmtElementReveal),
+    DmtDeploy(TapOrderKey, DmtDeployReveal),
+    DmtMint(TapOrderKey, DmtMintReveal),
+    TokenDeploy(TapOrderKey, TokenDeployReveal),
+    TokenMint(TapOrderKey, TokenMintReveal),
+    SendReveal(TapOrderKey, PendingSendReveal),
+    TradeReveal(TapOrderKey, PendingTradeReveal),
+    AuthReveal(TapOrderKey, PendingAuthReveal),
+    PrivilegeAuthReveal(TapOrderKey, PendingPrivilegeAuthReveal),
+    Control(TapOrderKey, ControlInscribe),
+    AuthRedeem(AuthRedeemReveal),
+    TransferInscribe(OrderedTransferInscribe),
 }
 
 impl Syncer {
@@ -128,7 +236,7 @@ impl Syncer {
             next_event_id: 0,
             bits_cache: HashMap::new(),
             tracker: None,
-            tracker_baseline_keys: std::collections::HashSet::new(),
+            tracker_dirty_keys: HashSet::new(),
             pending_blocks: 0,
             pending_broadcasts: Vec::new(),
         }
@@ -145,6 +253,7 @@ impl Syncer {
     pub async fn run(mut self) -> Result<()> {
         self.rpc.preflight().await?;
         self.seed_cursor_if_empty()?;
+        self.migrate_events_by_id()?;
         self.seed_next_event_id()?;
         self.migrate_transferables_by_sender()?;
 
@@ -153,6 +262,8 @@ impl Syncer {
                 detect_reorg(&self.store, &self.rpc, self.cfg.sync.finality_depth).await?
             {
                 rewind_cursor(&self.store, rewind)?;
+                self.tracker = None;
+                self.tracker_dirty_keys.clear();
             }
             let advanced = self.tick().await?;
             if !advanced {
@@ -198,17 +309,26 @@ impl Syncer {
         use crate::protocol::element::ElementField;
         use crate::protocol::ticker::normalize_ticker;
 
+        let nat_activation_height = 817_709;
+        if self.cfg.sync.start_height <= nat_activation_height {
+            return Ok(());
+        }
+
         let known = vec![Deployment {
-            ticker: normalize_ticker("nat").unwrap(),
+            ticker: normalize_ticker("dmt-nat").unwrap(),
             deploy_inscription_id:
                 "4d967af36dcacd7e6199c39bda855d7b1b37268f4c8031fed5403a99ac57fe67i0".to_string(),
+            dmt: true,
             element_inscription_id:
                 "63b5bd2e28c043c4812981718e65d202ab8f68c0f6a1834d9ebea49d8fac7e62i0".to_string(),
             element_field: ElementField::Bits,
             dt: Some("n".into()),
             dim: None,
             bits_mode: BitsMode::RawHex,
-            activation_height: 817_709,
+            decimals: 0,
+            mint_limit: 0,
+            privilege_auth: None,
+            activation_height: nat_activation_height,
             coinbase_activation: Some(NAT_COINBASE_ACTIVATION),
             miner_transfer_activation: Some(NAT_MINER_TRANSFER_ACTIVATION),
             max_supply: crate::ledger::deploy::NAT_MAX_SUPPLY,
@@ -230,16 +350,63 @@ impl Syncer {
 
     fn seed_next_event_id(&mut self) -> Result<()> {
         let tx = self.store.read()?;
-        let table = tx.open_table(EVENTS)?;
-        let mut max_id: u64 = 0;
-        for row in table.iter()? {
-            let (k, _) = row?;
-            let (_t, id) = k.value();
-            if id > max_id {
-                max_id = id;
+        if let Some(next_event_id) = tables::next_event_id_get(&tx)? {
+            self.next_event_id = next_event_id;
+            return Ok(());
+        }
+
+        let table = tx.open_table(EVENTS_BY_ID)?;
+        let max_id: u64 = table
+            .iter()?
+            .rev()
+            .next()
+            .transpose()?
+            .map(|(k, _)| k.value())
+            .unwrap_or(0);
+        self.next_event_id = max_id + 1;
+        drop(table);
+        drop(tx);
+
+        let wtx = self.store.write()?;
+        tables::next_event_id_set(&wtx, self.next_event_id)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    /// Back-fill the global event stream index from the legacy
+    /// per-ticker event table. New writes maintain both tables.
+    fn migrate_events_by_id(&self) -> Result<()> {
+        const FLAG: &str = "migration_events_by_id_v1";
+        let rtx = self.store.read()?;
+        let meta = rtx.open_table(tables::META)?;
+        let already = meta.get(FLAG)?.is_some();
+        drop(meta);
+        drop(rtx);
+        if already {
+            return Ok(());
+        }
+
+        let wtx = self.store.write()?;
+        let mut inserted = 0u64;
+        {
+            let events = wtx.open_table(EVENTS)?;
+            let mut by_id = wtx.open_table(EVENTS_BY_ID)?;
+            for row in events.iter()? {
+                let Ok((_k, v)) = row else { continue };
+                let Ok(ev) = decode::<LedgerEvent>(v.value()) else {
+                    continue;
+                };
+                by_id.insert(ev.event_id, v.value())?;
+                inserted += 1;
             }
         }
-        self.next_event_id = max_id + 1;
+        {
+            let done: &[u8] = b"done";
+            let mut meta = wtx.open_table(tables::META)?;
+            meta.insert(FLAG, done)?;
+        }
+        wtx.commit()?;
+        info!(inserted, "backfilled events_by_id index");
         Ok(())
     }
 
@@ -367,9 +534,9 @@ impl Syncer {
         // batch but nothing uncommitted (there's nothing uncommitted
         // — we just opened the tx).
         if self.tracker.is_none() {
-            let (tracker, keys) = self.load_tracker_from(&wtx)?;
+            let tracker = self.load_tracker_from(&wtx)?;
             self.tracker = Some(tracker);
-            self.tracker_baseline_keys = keys;
+            self.tracker_dirty_keys.clear();
         }
         Ok(wtx)
     }
@@ -390,8 +557,7 @@ impl Syncer {
         // Persist carrier map diffs for the batch. We kept the tracker
         // in memory across all blocks in this batch; now flush once.
         if let Some(tracker) = self.tracker.as_ref() {
-            let baseline = self.tracker_baseline_keys.clone();
-            self.save_carriers(&wtx, tracker, &baseline)?;
+            self.save_dirty_carriers(&wtx, tracker)?;
         }
         // Advance cursor to the last applied height. apply_block sets
         // the cursor per-block, but only the committed write counts —
@@ -406,22 +572,9 @@ impl Syncer {
                 },
             )?;
         }
+        tables::next_event_id_set(&wtx, self.next_event_id)?;
         wtx.commit()?;
-
-        // After commit, reload the tracker baseline so the next batch
-        // starts with the right diff reference.
-        {
-            let rtx = self.store.read()?;
-            let mut keys = std::collections::HashSet::new();
-            if let Ok(t) = rtx.open_multimap_table(INSCRIPTION_OWNERS) {
-                for r in t.iter()? {
-                    if let Ok((k, _)) = r {
-                        keys.insert(k.value().to_string());
-                    }
-                }
-            }
-            self.tracker_baseline_keys = keys;
-        }
+        self.tracker_dirty_keys.clear();
         self.pending_blocks = 0;
 
         // Now broadcast all pending events. Subscribers only see events
@@ -461,7 +614,7 @@ impl Syncer {
         // Load active deployments (by ticker) — reads from the current
         // write tx, so new deploys registered earlier in the same
         // batch are visible.
-        let deployments = self.load_deployments_from(wtx)?;
+        let mut deployments = self.load_deployments_from(wtx)?;
         // Build intra-block UTXO cache: for any tx in this block we
         // already know its outputs without hitting RPC. Covers the
         // common case where a later tx in the same block spends an
@@ -490,10 +643,21 @@ impl Syncer {
             /// Position within the tx's envelope list (for within-block rank).
             env_pos: u32,
             /// OP_2 pointer value if the envelope carried one. None ≡
-            /// default sat-flow (inscription lands at sat 0 of the tx's
-            /// combined output range → vout 0 offset 0).
+            /// default sat-flow (inscription lands at the output-range
+            /// offset equal to the cumulative input value before this
+            /// envelope's input).
             pointer: Option<u64>,
-            payload: TapEnvelope,
+            /// Input index that carried this envelope. ord-tap uses the
+            /// cumulative input value before this input as the default
+            /// fresh-inscription offset.
+            input_index: u32,
+            env: Envelope,
+            payload: Option<ParsedPayload>,
+        }
+        #[derive(Clone)]
+        enum ParsedPayload {
+            Tap(TapEnvelope),
+            DmtElement(DmtElementPayload),
         }
         struct PreParsedTx {
             tx_index: u32,
@@ -501,6 +665,23 @@ impl Syncer {
             envelopes: Vec<ParsedEnvelope>,
         }
         let block_height = block.height;
+        let decode_payload = |env: &Envelope| -> Option<ParsedPayload> {
+            if let Ok(Some(payload)) = decode_tap_payload_at_height(env, block_height) {
+                Some(ParsedPayload::Tap(payload))
+            } else if tap_compatible_content_type(env) {
+                let body = env.decoded_content();
+                std::str::from_utf8(&body)
+                    .ok()
+                    .and_then(|s| {
+                        crate::protocol::element::parse_dmt_element(s)
+                            .ok()
+                            .flatten()
+                    })
+                    .map(ParsedPayload::DmtElement)
+            } else {
+                None
+            }
+        };
         let pre_parsed: Vec<PreParsedTx> = block
             .txs
             .par_iter()
@@ -510,7 +691,12 @@ impl Syncer {
                     crate::inscription::envelope::parse_envelopes_at_height(&txv.tx, block_height);
                 let mut with_payloads = Vec::new();
                 for (env_pos, env) in envelopes.iter().enumerate() {
-                    if let Ok(Some(payload)) = decode_tap_payload(env) {
+                    let payload = if env.delegate.is_none() {
+                        decode_payload(env)
+                    } else {
+                        None
+                    };
+                    if payload.is_some() || env.delegate.is_some() {
                         let global_index = match env.kind {
                             crate::inscription::envelope::EnvelopeKind::Inscription { index } => {
                                 index
@@ -520,6 +706,8 @@ impl Syncer {
                             global_index,
                             env_pos: env_pos as u32,
                             pointer: env.pointer,
+                            input_index: env.input_index,
+                            env: env.clone(),
                             payload,
                         });
                     }
@@ -533,15 +721,16 @@ impl Syncer {
             .collect();
 
         let mut mint_cands: HashMap<String, Vec<MintCandidate>> = HashMap::new();
-        let mut transfer_inscribes_unresolved: Vec<TransferInscribeCandidate> = Vec::new();
-        let mut transfer_inscribe_meta: HashMap<String, TransferInscribe> = HashMap::new();
-        let mut control_inscribes: Vec<ControlInscribe> = Vec::new();
-        let mut send_reveals: Vec<PendingSendReveal> = Vec::new();
-        let mut auth_reveals: Vec<PendingAuthReveal> = Vec::new();
+        let mut transfer_inscribes_unresolved: Vec<OrderedTransferInscribe> = Vec::new();
+        let mut ordered_reveals: Vec<OrderedTapOp> = Vec::new();
+        let token_deploy_reveals: Vec<TokenDeployReveal> = Vec::new();
+        let token_mint_reveals: Vec<TokenMintReveal> = Vec::new();
         let mut auth_redeem_reveals: Vec<AuthRedeemReveal> = Vec::new();
         let mut fresh_carriers: Vec<(OutPoint, TrackedCarrier, Option<String>)> = Vec::new();
         let mut moves: Vec<(u32, TrackerMove)> = Vec::new();
+        let mut fee_prefixes: Option<Vec<u64>> = None;
         let mut inscription_rows: Vec<(String, InscriptionIndex)> = Vec::new();
+        let mut delegate_payload_cache: HashMap<String, Option<Envelope>> = HashMap::new();
 
         for pre in &pre_parsed {
             let tx_index = pre.tx_index;
@@ -554,22 +743,73 @@ impl Syncer {
             // spend check never matches because the carrier wasn't in
             // the tracker yet.
             let carriers_before = fresh_carriers.len();
+            let total_output_value: u64 = txv.tx.output.iter().map(|o| o.value.to_sat()).sum();
+            let needs_input_offsets = pre.envelopes.iter().any(|pe| {
+                let pointer_lands = matches!(pe.pointer, Some(p) if p < total_output_value);
+                pe.input_index > 0 && !pointer_lands
+            });
+            let input_start_offsets = if needs_input_offsets {
+                let input_values = self
+                    .load_input_values(&txv.tx, tracker, &block_utxos)
+                    .await?;
+                let mut offsets = Vec::with_capacity(txv.tx.input.len());
+                let mut cumulative = 0u64;
+                for txin in &txv.tx.input {
+                    offsets.push(cumulative);
+                    cumulative = cumulative.saturating_add(
+                        input_values
+                            .get(&txin.previous_output)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
+                Some(offsets)
+            } else {
+                None
+            };
             for pe in &pre.envelopes {
-                // Ord-tap's default sat-flow: each fresh envelope on
-                // input 0 starts at sat 0 of the tx's output range
-                // (= `total_input_value` at the input-0 boundary =
-                // cumulative input sum before we enter the input loop,
-                // which is 0). A pointer tag reroutes the inscription
-                // to `pointer` if `pointer < total_output_value`.
+                if block.height < JUBILEE_HEIGHT
+                    && pe.pointer.is_none()
+                    && txv
+                        .tx
+                        .input
+                        .get(pe.input_index as usize)
+                        .map(|txin| tracker.has_at_offset(&txin.previous_output, 0))
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let payload = if let Some(payload) = pe.payload.clone() {
+                    payload
+                } else {
+                    let Some(effective) = self
+                        .resolve_effective_delegate_envelope(&pe.env, &mut delegate_payload_cache)
+                        .await?
+                    else {
+                        continue;
+                    };
+                    let Some(payload) = decode_payload(&effective) else {
+                        continue;
+                    };
+                    payload
+                };
+                // Ord-tap's default sat-flow: each fresh envelope starts
+                // at `total_input_value` before the input that carried it.
+                // A pointer tag reroutes the inscription to `pointer` if
+                // `pointer < total_output_value`.
                 // Ref: ord-tap `index/updater/inscription_updater.rs:458,520-524`.
                 //
                 // Resolve that absolute sat offset into `(vout,
                 // offset_in_outpoint)` by walking outputs once.
-                // Without a pointer this is always (0, 0) — same as
-                // the prior default. With a pointer ≥ total_output it
-                // also falls back to (0, 0). Otherwise it routes to
-                // whichever output contains the pointed-at sat.
-                let (landing_vout, landing_offset) = resolve_landing(&txv.tx, pe.pointer);
+                let default_offset = input_start_offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.get(pe.input_index as usize).copied())
+                    .unwrap_or(0);
+                let Some((landing_vout, landing_offset)) =
+                    resolve_landing(&txv.tx, pe.pointer, default_offset)
+                else {
+                    continue;
+                };
                 let to_addr = txv.tx.output.get(landing_vout).and_then(|o| {
                     if o.script_pubkey.is_op_return() {
                         None
@@ -582,297 +822,118 @@ impl Syncer {
                 // stable, canonical order without needing chain-wide
                 // inscription_number.
                 let within_block_rank = i64::from(tx_index) * 1_000_000 + pe.env_pos as i64;
+                let sequence_rank = inscription_sequence_rank(block.height, within_block_rank);
                 let insc_id = format!("{}i{}", pre.txid, pe.global_index);
-                // Take payload by clone to keep pre_parsed immutable
-                // for now; could be optimized later.
-                let payload = pe.payload.clone();
-                // dmt-indexer v0.1.0 indexes only $NAT. Non-NAT
-                // DMT/TAP inscriptions (even well-formed ones) are
-                // skipped here without being registered, so the rest
-                // of the pipeline never wastes work on them.
-                //
-                // Form depends on op per ord-tap. dmt-deploy registers
-                // the ticker under its `dmt-`-prefixed effective form
-                // (`dmt-nat`) and dmt-mint does the same prefix prepend
-                // at lookup. Every other op (token-transfer/send/trade
-                // /auth/block/unblock) looks up the deploy literally
-                // under the ticker supplied in the payload — so the
-                // payload MUST carry the long form `dmt-nat`, not the
-                // short `nat`. Accepting bare `nat` for transfer-style
-                // ops over-admits inscriptions ord-tap rejects (see
-                // f88d1954…5a i0 at block 824,343, which reserved 1,000
-                // units of transferable and cascaded a −11.86B short
-                // through bc1plzjl35 → bc1pjhq8xseesnjv).
-                if !envelope_matches_indexed(&payload) {
-                    continue;
-                }
-                let tick_canon = canonical_ticker(payload.ticker());
+                let order_key = TapOrderKey::new(
+                    tx_index,
+                    landing_vout as u32,
+                    landing_offset,
+                    1,
+                    within_block_rank,
+                );
                 match payload {
-                    TapEnvelope::Deploy(_dp) => {
-                        // NAT is seeded at startup. A fresh on-chain
-                        // `nat` deploy would hit this arm, find the
-                        // ticker already registered, and drop. Record
-                        // an inscription row for diagnostic visibility
-                        // of the attempt.
+                    ParsedPayload::DmtElement(ep) => {
+                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
+                            continue;
+                        };
+                        ordered_reveals.push(OrderedTapOp::DmtElement(
+                            order_key,
+                            DmtElementReveal {
+                                inscription_id: insc_id.clone(),
+                                owner: addr.as_str().to_string(),
+                                txid: pre.txid.to_string(),
+                                landing_vout: landing_vout as u32,
+                                payload: ep.clone(),
+                            },
+                        ));
                         inscription_rows.push((
                             insc_id,
                             InscriptionIndex {
-                                ticker: "nat".to_string(),
-                                kind: "dmt-deploy".to_string(),
+                                ticker: format!("dmt-el:{}", ep.name),
+                                kind: "dmt-element".to_string(),
                                 original_amount: None,
                                 inscribed_height: block.height,
                                 current_owner_address: to_addr.clone(),
                                 consumed_height: None,
                             },
                         ));
+                        continue;
                     }
-                    TapEnvelope::Mint(mp) => {
-                        let Some(dep) = deployments.get(tick_canon.as_str()) else {
-                            continue;
-                        };
-                        // Short-circuit bogus `blk` values so we don't
-                        // RPC a non-existent height (which would fail
-                        // with code=-8 and kill the tick). Downstream
-                        // rejects them as blk_out_of_range.
-                        let referenced_bits =
-                            if mp.block_number == 0 || mp.block_number > block.height {
-                                0
-                            } else if mp.block_number == block.height {
-                                block.bits
-                            } else if let Some(&b) = self.bits_cache.get(&mp.block_number) {
-                                b
-                            } else {
-                                let b = fetch_block_bits_retry(&self.rpc, mp.block_number).await?;
-                                if self.bits_cache.len() > 4096 {
-                                    self.bits_cache.clear();
+                    ParsedPayload::Tap(payload) => {
+                        // Admit all supported TAP envelopes. Per-op deployment
+                        // lookups below decide whether an inscription is active;
+                        // this is required for token-trade parity because DMT-NAT
+                        // trades can settle against non-DMT TAP tokens.
+                        let tick_canon = canonical_ticker(payload.ticker());
+                        match payload {
+                            TapEnvelope::TokenDeploy(dp) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                ordered_reveals.push(OrderedTapOp::TokenDeploy(
+                                    order_key,
+                                    TokenDeployReveal {
+                                        inscription_id: insc_id.clone(),
+                                        tx_index,
+                                        owner: addr.as_str().to_string(),
+                                        payload: dp.clone(),
+                                    },
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: tick_canon.clone(),
+                                        kind: "token-deploy".to_string(),
+                                        original_amount: Some(dp.max_supply),
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::TokenMint(mp) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                ordered_reveals.push(OrderedTapOp::TokenMint(
+                                    order_key,
+                                    TokenMintReveal {
+                                        inscription_id: insc_id.clone(),
+                                        tx_index,
+                                        owner: addr.as_str().to_string(),
+                                        payload: mp.clone(),
+                                    },
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: tick_canon.clone(),
+                                        kind: "token-mint".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::Deploy(dp) => {
+                                if let Some(addr) = to_addr.as_deref().and_then(normalize_address) {
+                                    ordered_reveals.push(OrderedTapOp::DmtDeploy(
+                                        order_key,
+                                        DmtDeployReveal {
+                                            inscription_id: insc_id.clone(),
+                                            owner: addr.as_str().to_string(),
+                                            payload: dp.clone(),
+                                        },
+                                    ));
                                 }
-                                self.bits_cache.insert(mp.block_number, b);
-                                b
-                            };
-                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
-                            continue;
-                        };
-                        mint_cands
-                            .entry(dep.ticker.as_str().to_string())
-                            .or_default()
-                            .push(MintCandidate {
-                                inscription_id: insc_id.clone(),
-                                inscription_number: within_block_rank,
-                                inscribed_block_height: block.height,
-                                address: addr,
-                                payload: mp.clone(),
-                                referenced_bits,
-                                tx_index,
-                            });
-                        // Track the mint inscription as a carrier so its
-                        // `INSCRIPTIONS.current_owner_address` updates
-                        // when the UNAT moves. Balance is not affected —
-                        // mint credits stay with the original inscriber.
-                        let reveal_value = txv
-                            .tx
-                            .output
-                            .get(landing_vout)
-                            .map(|o| o.value.to_sat())
-                            .unwrap_or(0);
-                        fresh_carriers.push((
-                            OutPoint {
-                                txid: txv.txid,
-                                vout: landing_vout as u32,
-                            },
-                            TrackedCarrier {
-                                inscription: TrackedInscription {
-                                    inscription_id: insc_id.clone(),
-                                    ticker: tick_canon.clone(),
-                                    kind: InscriptionKind::Mint,
-                                },
-                                offset_in_outpoint: landing_offset,
-                                outpoint_value_sats: reveal_value,
-                            },
-                            to_addr.clone(),
-                        ));
-                        inscription_rows.push((
-                            insc_id,
-                            InscriptionIndex {
-                                ticker: tick_canon.clone(),
-                                kind: "dmt-mint".to_string(),
-                                original_amount: None,
-                                inscribed_height: block.height,
-                                current_owner_address: to_addr.clone(),
-                                consumed_height: None,
-                            },
-                        ));
-                    }
-                    TapEnvelope::Transfer(tp) => {
-                        let Some(_) = deployments.get(tick_canon.as_str()) else {
-                            continue;
-                        };
-                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
-                            continue;
-                        };
-                        transfer_inscribes_unresolved.push(TransferInscribeCandidate {
-                            inscription_id: insc_id.clone(),
-                            inscription_number: within_block_rank,
-                            inscribed_block_height: block.height,
-                            ticker: tick_canon.clone(),
-                            address: addr.clone(),
-                            amount: tp.amount,
-                            tx_index,
-                        });
-                        transfer_inscribe_meta.insert(
-                            insc_id.clone(),
-                            TransferInscribe {
-                                inscription_id: insc_id.clone(),
-                                ticker: tick_canon.clone(),
-                                address: addr.as_str().to_string(),
-                                amount: tp.amount,
-                            },
-                        );
-                        let reveal_value = txv
-                            .tx
-                            .output
-                            .get(landing_vout)
-                            .map(|o| o.value.to_sat())
-                            .unwrap_or(0);
-                        fresh_carriers.push((
-                            OutPoint {
-                                txid: txv.txid,
-                                vout: landing_vout as u32,
-                            },
-                            TrackedCarrier {
-                                inscription: TrackedInscription {
-                                    inscription_id: insc_id.clone(),
-                                    ticker: tick_canon.clone(),
-                                    kind: InscriptionKind::TokenTransfer,
-                                },
-                                offset_in_outpoint: landing_offset,
-                                outpoint_value_sats: reveal_value,
-                            },
-                            to_addr.clone(),
-                        ));
-                        inscription_rows.push((
-                            insc_id,
-                            InscriptionIndex {
-                                ticker: tick_canon.clone(),
-                                kind: "token-transfer".to_string(),
-                                original_amount: Some(tp.amount),
-                                inscribed_height: block.height,
-                                current_owner_address: to_addr.clone(),
-                                consumed_height: None,
-                            },
-                        ));
-                    }
-                    TapEnvelope::Send(sp) => {
-                        // Miner-reward shield at reveal time. ord-tap
-                        // `/tmp/ot_send.rs:26-27`. Shield is also
-                        // re-checked at move time.
-                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
-                            continue;
-                        };
-                        if is_dmt_reward_address(wtx, addr.as_str())? {
-                            continue;
-                        }
-                        // Filter items to the indexed ticker. Per-item
-                        // other-ticker drops are silent (parity with the
-                        // coarse envelope filter).
-                        let mut items: Vec<crate::store::tables::PendingSendItem> = Vec::new();
-                        for it in sp.items.iter() {
-                            if canonical_ticker(it.ticker.as_str()) != "nat" {
-                                continue;
-                            }
-                            items.push(crate::store::tables::PendingSendItem {
-                                ticker: canonical_ticker(it.ticker.as_str()),
-                                recipient: it.recipient.as_str().to_string(),
-                                amount: it.amount,
-                                dta: it.dta.clone(),
-                            });
-                        }
-                        if items.is_empty() {
-                            continue;
-                        }
-                        send_reveals.push(PendingSendReveal {
-                            inscription_id: insc_id.clone(),
-                            creator: addr.as_str().to_string(),
-                            tx_index,
-                            items,
-                        });
-                        let reveal_value = txv
-                            .tx
-                            .output
-                            .get(landing_vout)
-                            .map(|o| o.value.to_sat())
-                            .unwrap_or(0);
-                        fresh_carriers.push((
-                            OutPoint {
-                                txid: txv.txid,
-                                vout: landing_vout as u32,
-                            },
-                            TrackedCarrier {
-                                inscription: TrackedInscription {
-                                    inscription_id: insc_id.clone(),
-                                    ticker: "nat".to_string(),
-                                    kind: InscriptionKind::TokenSend,
-                                },
-                                offset_in_outpoint: landing_offset,
-                                outpoint_value_sats: reveal_value,
-                            },
-                            to_addr.clone(),
-                        ));
-                        inscription_rows.push((
-                            insc_id,
-                            InscriptionIndex {
-                                ticker: "nat".to_string(),
-                                kind: "token-send".to_string(),
-                                original_amount: None,
-                                inscribed_height: block.height,
-                                current_owner_address: to_addr.clone(),
-                                consumed_height: None,
-                            },
-                        ));
-                    }
-                    TapEnvelope::Auth(ap) => {
-                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
-                            continue;
-                        };
-                        let creator = addr.as_str().to_string();
-                        let reveal_value = txv
-                            .tx
-                            .output
-                            .get(landing_vout)
-                            .map(|o| o.value.to_sat())
-                            .unwrap_or(0);
-                        match &ap.form {
-                            TokenAuthForm::Redeem(r) => {
-                                // Redeems execute AT REVEAL. Queue with
-                                // the full payload for the write phase.
-                                auth_redeem_reveals.push(AuthRedeemReveal {
-                                    inscription_id: insc_id.clone(),
-                                    tx_index,
-                                    inscriber_addr: creator.clone(),
-                                    payload: r.clone(),
-                                });
-                                // Track the carrier so INSCRIPTIONS row
-                                // stays fresh on later transfers.
-                                fresh_carriers.push((
-                                    OutPoint {
-                                        txid: txv.txid,
-                                        vout: landing_vout as u32,
-                                    },
-                                    TrackedCarrier {
-                                        inscription: TrackedInscription {
-                                            inscription_id: insc_id.clone(),
-                                            ticker: "nat".to_string(),
-                                            kind: InscriptionKind::TokenAuth,
-                                        },
-                                        offset_in_outpoint: landing_offset,
-                                        outpoint_value_sats: reveal_value,
-                                    },
-                                    to_addr.clone(),
-                                ));
                                 inscription_rows.push((
                                     insc_id,
                                     InscriptionIndex {
-                                        ticker: "nat".to_string(),
-                                        kind: "token-auth".to_string(),
+                                        ticker: dmt_effective_ticker(dp.ticker.as_str()),
+                                        kind: "dmt-deploy".to_string(),
                                         original_amount: None,
                                         inscribed_height: block.height,
                                         current_owner_address: to_addr.clone(),
@@ -880,29 +941,75 @@ impl Syncer {
                                     },
                                 ));
                             }
-                            TokenAuthForm::Create(c) => {
-                                // Serialize the auth array byte-exact
-                                // for later re-hash at move time.
-                                let auth_array_json = match serde_json::to_string(&c.auth_array_raw)
+                            TapEnvelope::Mint(mp) => {
+                                // Short-circuit bogus `blk` values so we don't
+                                // RPC a non-existent height (which would fail
+                                // with code=-8 and kill the tick). Downstream
+                                // rejects them as blk_out_of_range.
+                                let (referenced_bits, referenced_nonce) = if mp.block_number
+                                    > block.height
                                 {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
+                                    (0, 0)
+                                } else if mp.block_number == block.height {
+                                    (block.bits, block.nonce)
+                                } else if let Some(&b) = self.bits_cache.get(&mp.block_number) {
+                                    let (_bits, nonce) =
+                                        fetch_block_header_fields_retry(&self.rpc, mp.block_number)
+                                            .await?;
+                                    (b, nonce)
+                                } else {
+                                    let (b, nonce) =
+                                        fetch_block_header_fields_retry(&self.rpc, mp.block_number)
+                                            .await?;
+                                    if self.bits_cache.len() > 4096 {
+                                        self.bits_cache.clear();
+                                    }
+                                    self.bits_cache.insert(mp.block_number, b);
+                                    (b, nonce)
                                 };
-                                let form = crate::store::tables::PendingAuthForm::Create {
-                                    auth_tickers: c.auth_tickers.clone(),
-                                    sig_v: c.sig.v.clone(),
-                                    sig_r: c.sig.r.clone(),
-                                    sig_s: c.sig.s.clone(),
-                                    hash_hex: c.hash.clone(),
-                                    salt: c.salt.clone(),
-                                    auth_array_json,
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
                                 };
-                                auth_reveals.push(PendingAuthReveal {
-                                    inscription_id: insc_id.clone(),
-                                    creator: creator.clone(),
-                                    tx_index,
-                                    form,
-                                });
+                                let dmt_ticker = dmt_effective_ticker(mp.ticker.as_str());
+                                if dmt_ticker == "dmt-nat" {
+                                    if let Some(dep) = deployments.get(dmt_ticker.as_str()) {
+                                        mint_cands
+                                            .entry(dep.ticker.as_str().to_string())
+                                            .or_default()
+                                            .push(MintCandidate {
+                                                inscription_id: insc_id.clone(),
+                                                inscription_number: within_block_rank,
+                                                inscribed_block_height: block.height,
+                                                address: addr.clone(),
+                                                payload: mp.clone(),
+                                                referenced_bits,
+                                                tx_index,
+                                            });
+                                    }
+                                } else {
+                                    ordered_reveals.push(OrderedTapOp::DmtMint(
+                                        order_key,
+                                        DmtMintReveal {
+                                            inscription_id: insc_id.clone(),
+                                            owner: addr.as_str().to_string(),
+                                            payload: mp.clone(),
+                                            referenced_bits,
+                                            referenced_nonce,
+                                            blk_repr: mp.block_raw.clone(),
+                                        },
+                                    ));
+                                }
+                                // Track the mint inscription as a carrier so its
+                                // `INSCRIPTIONS.current_owner_address` updates
+                                // when the UNAT moves. Balance is not affected —
+                                // mint credits stay with the original inscriber.
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
                                 fresh_carriers.push((
                                     OutPoint {
                                         txid: txv.txid,
@@ -911,8 +1018,9 @@ impl Syncer {
                                     TrackedCarrier {
                                         inscription: TrackedInscription {
                                             inscription_id: insc_id.clone(),
-                                            ticker: "nat".to_string(),
-                                            kind: InscriptionKind::TokenAuth,
+                                            ticker: dmt_ticker.clone(),
+                                            kind: InscriptionKind::Mint,
+                                            sequence_rank,
                                         },
                                         offset_in_outpoint: landing_offset,
                                         outpoint_value_sats: reveal_value,
@@ -922,8 +1030,8 @@ impl Syncer {
                                 inscription_rows.push((
                                     insc_id,
                                     InscriptionIndex {
-                                        ticker: "nat".to_string(),
-                                        kind: "token-auth".to_string(),
+                                        ticker: dmt_ticker.clone(),
+                                        kind: "dmt-mint".to_string(),
                                         original_amount: None,
                                         inscribed_height: block.height,
                                         current_owner_address: to_addr.clone(),
@@ -931,16 +1039,34 @@ impl Syncer {
                                     },
                                 ));
                             }
-                            TokenAuthForm::Cancel(c) => {
-                                let form = crate::store::tables::PendingAuthForm::Cancel {
-                                    cancel_id: c.cancel_id.clone(),
+                            TapEnvelope::Transfer(tp) => {
+                                if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+                                    && tp.amount_was_number
+                                {
+                                    continue;
+                                }
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
                                 };
-                                auth_reveals.push(PendingAuthReveal {
+                                transfer_inscribes_unresolved.push(OrderedTransferInscribe {
                                     inscription_id: insc_id.clone(),
-                                    creator: creator.clone(),
+                                    inscription_number: within_block_rank,
+                                    inscribed_block_height: block.height,
+                                    ticker: tick_canon.clone(),
+                                    raw_ticker: tp.ticker.as_str().to_string(),
+                                    address: addr.clone(),
+                                    amount_raw: tp.amount_raw.clone(),
                                     tx_index,
-                                    form,
+                                    landing_vout: landing_vout as u32,
+                                    landing_offset,
                                 });
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
                                 fresh_carriers.push((
                                     OutPoint {
                                         txid: txv.txid,
@@ -949,8 +1075,9 @@ impl Syncer {
                                     TrackedCarrier {
                                         inscription: TrackedInscription {
                                             inscription_id: insc_id.clone(),
-                                            ticker: "nat".to_string(),
-                                            kind: InscriptionKind::TokenAuth,
+                                            ticker: tick_canon.clone(),
+                                            kind: InscriptionKind::TokenTransfer,
+                                            sequence_rank,
                                         },
                                         offset_in_outpoint: landing_offset,
                                         outpoint_value_sats: reveal_value,
@@ -960,8 +1087,414 @@ impl Syncer {
                                 inscription_rows.push((
                                     insc_id,
                                     InscriptionIndex {
-                                        ticker: "nat".to_string(),
-                                        kind: "token-auth".to_string(),
+                                        ticker: tick_canon.clone(),
+                                        kind: "token-transfer".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::Send(sp) => {
+                                // Miner-reward shield at reveal time. ord-tap
+                                // `/tmp/ot_send.rs:26-27`. Shield is also
+                                // re-checked at move time.
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                if is_dmt_reward_address_at_height(
+                                    wtx,
+                                    addr.as_str(),
+                                    block.height,
+                                )? {
+                                    continue;
+                                }
+                                if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+                                    && sp.items.iter().any(|it| it.amount_was_number)
+                                {
+                                    continue;
+                                }
+                                if sp.items.iter().any(|it| {
+                                    !is_valid_tap_address_at_height(it.recipient.as_str(), block.height)
+                                }) {
+                                    continue;
+                                }
+                                let index_ticker = sp
+                                    .items
+                                    .first()
+                                    .map(|i| canonical_ticker(i.ticker.as_str()))
+                                    .unwrap_or_else(|| "dmt-nat".to_string());
+                                ordered_reveals.push(OrderedTapOp::SendReveal(
+                                    order_key,
+                                    PendingSendReveal {
+                                        inscription_id: insc_id.clone(),
+                                        creator: addr.as_str().to_string(),
+                                        tx_index,
+                                        event_ticker: index_ticker.clone(),
+                                        payload: sp.clone(),
+                                    },
+                                ));
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: index_ticker.clone(),
+                                            kind: InscriptionKind::TokenSend,
+                                            sequence_rank,
+                                        },
+                                        offset_in_outpoint: landing_offset,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: index_ticker,
+                                        kind: "token-send".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::Auth(ap) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                let creator = addr.as_str().to_string();
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
+                                match &ap.form {
+                                    TokenAuthForm::Redeem(r) => {
+                                        // Redeems execute AT REVEAL. Queue with
+                                        // the full payload for the write phase.
+                                        auth_redeem_reveals.push(AuthRedeemReveal {
+                                            inscription_id: insc_id.clone(),
+                                            tx_index,
+                                            landing_vout: landing_vout as u32,
+                                            landing_offset,
+                                            rank: within_block_rank,
+                                            inscriber_addr: creator.clone(),
+                                            payload: r.clone(),
+                                        });
+                                        // Track the carrier so INSCRIPTIONS row
+                                        // stays fresh on later transfers.
+                                        fresh_carriers.push((
+                                            OutPoint {
+                                                txid: txv.txid,
+                                                vout: landing_vout as u32,
+                                            },
+                                            TrackedCarrier {
+                                                inscription: TrackedInscription {
+                                                    inscription_id: insc_id.clone(),
+                                                    ticker: "dmt-nat".to_string(),
+                                                    kind: InscriptionKind::TokenAuth,
+                                                    sequence_rank,
+                                                },
+                                                offset_in_outpoint: landing_offset,
+                                                outpoint_value_sats: reveal_value,
+                                            },
+                                            to_addr.clone(),
+                                        ));
+                                        inscription_rows.push((
+                                            insc_id,
+                                            InscriptionIndex {
+                                                ticker: "dmt-nat".to_string(),
+                                                kind: "token-auth".to_string(),
+                                                original_amount: None,
+                                                inscribed_height: block.height,
+                                                current_owner_address: to_addr.clone(),
+                                                consumed_height: None,
+                                            },
+                                        ));
+                                    }
+                                    TokenAuthForm::Create(c) => {
+                                        let auth_tickers: Vec<String> = c
+                                            .auth_tickers
+                                            .iter()
+                                            .map(|t| canonical_ticker(t))
+                                            .collect();
+                                        // Serialize the auth array byte-exact
+                                        // for later re-hash at move time.
+                                        let auth_array_json =
+                                            match serde_json::to_string(&c.auth_array_raw) {
+                                                Ok(s) => s,
+                                                Err(_) => continue,
+                                            };
+                                        let form = crate::store::tables::PendingAuthForm::Create {
+                                            auth_tickers,
+                                            sig_v: c.sig.v.clone(),
+                                            sig_r: c.sig.r.clone(),
+                                            sig_s: c.sig.s.clone(),
+                                            hash_hex: c.hash.clone(),
+                                            salt: c.salt.clone(),
+                                            auth_array_json,
+                                        };
+                                        ordered_reveals.push(OrderedTapOp::AuthReveal(
+                                            order_key,
+                                            PendingAuthReveal {
+                                                inscription_id: insc_id.clone(),
+                                                creator: creator.clone(),
+                                                tx_index,
+                                                form,
+                                            },
+                                        ));
+                                        fresh_carriers.push((
+                                            OutPoint {
+                                                txid: txv.txid,
+                                                vout: landing_vout as u32,
+                                            },
+                                            TrackedCarrier {
+                                                inscription: TrackedInscription {
+                                                    inscription_id: insc_id.clone(),
+                                                    ticker: "dmt-nat".to_string(),
+                                                    kind: InscriptionKind::TokenAuth,
+                                                    sequence_rank,
+                                                },
+                                                offset_in_outpoint: landing_offset,
+                                                outpoint_value_sats: reveal_value,
+                                            },
+                                            to_addr.clone(),
+                                        ));
+                                        inscription_rows.push((
+                                            insc_id,
+                                            InscriptionIndex {
+                                                ticker: "dmt-nat".to_string(),
+                                                kind: "token-auth".to_string(),
+                                                original_amount: None,
+                                                inscribed_height: block.height,
+                                                current_owner_address: to_addr.clone(),
+                                                consumed_height: None,
+                                            },
+                                        ));
+                                    }
+                                    TokenAuthForm::Cancel(c) => {
+                                        let form = crate::store::tables::PendingAuthForm::Cancel {
+                                            cancel_id: c.cancel_id.clone(),
+                                        };
+                                        ordered_reveals.push(OrderedTapOp::AuthReveal(
+                                            order_key,
+                                            PendingAuthReveal {
+                                                inscription_id: insc_id.clone(),
+                                                creator: creator.clone(),
+                                                tx_index,
+                                                form,
+                                            },
+                                        ));
+                                        fresh_carriers.push((
+                                            OutPoint {
+                                                txid: txv.txid,
+                                                vout: landing_vout as u32,
+                                            },
+                                            TrackedCarrier {
+                                                inscription: TrackedInscription {
+                                                    inscription_id: insc_id.clone(),
+                                                    ticker: "dmt-nat".to_string(),
+                                                    kind: InscriptionKind::TokenAuth,
+                                                    sequence_rank,
+                                                },
+                                                offset_in_outpoint: landing_offset,
+                                                outpoint_value_sats: reveal_value,
+                                            },
+                                            to_addr.clone(),
+                                        ));
+                                        inscription_rows.push((
+                                            insc_id,
+                                            InscriptionIndex {
+                                                ticker: "dmt-nat".to_string(),
+                                                kind: "token-auth".to_string(),
+                                                original_amount: None,
+                                                inscribed_height: block.height,
+                                                current_owner_address: to_addr.clone(),
+                                                consumed_height: None,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                            TapEnvelope::PrivilegeAuth(ap) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                let creator = addr.as_str().to_string();
+                                let form = match ap.form {
+                                    PrivilegeAuthForm::Create(c) => {
+                                        crate::store::tables::PendingPrivilegeAuthForm::Create {
+                                            auth_json: c.auth_json.clone(),
+                                            sig_v: c.sig.v.clone(),
+                                            sig_r: c.sig.r.clone(),
+                                            sig_s: c.sig.s.clone(),
+                                            hash_hex: c.hash.clone(),
+                                            salt: c.salt.clone(),
+                                        }
+                                    }
+                                    PrivilegeAuthForm::Cancel(c) => {
+                                        crate::store::tables::PendingPrivilegeAuthForm::Cancel {
+                                            cancel_id: c.cancel_id.clone(),
+                                        }
+                                    }
+                                };
+                                ordered_reveals.push(OrderedTapOp::PrivilegeAuthReveal(
+                                    order_key,
+                                    PendingPrivilegeAuthReveal {
+                                        inscription_id: insc_id.clone(),
+                                        creator: creator.clone(),
+                                        form,
+                                    },
+                                ));
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: "dmt-nat".to_string(),
+                                            kind: InscriptionKind::PrivilegeAuth,
+                                            sequence_rank,
+                                        },
+                                        offset_in_outpoint: landing_offset,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: "dmt-nat".to_string(),
+                                        kind: "privilege-auth".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::Trade(tp) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                if is_dmt_reward_address_at_height(
+                                    wtx,
+                                    addr.as_str(),
+                                    block.height,
+                                )? {
+                                    continue;
+                                }
+                                ordered_reveals.push(OrderedTapOp::TradeReveal(
+                                    order_key,
+                                    PendingTradeReveal {
+                                        inscription_id: insc_id.clone(),
+                                        creator: addr.as_str().to_string(),
+                                        tx_index,
+                                        payload: tp.clone(),
+                                    },
+                                ));
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: tick_canon.clone(),
+                                            kind: InscriptionKind::TokenTrade,
+                                            sequence_rank,
+                                        },
+                                        offset_in_outpoint: landing_offset,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: tick_canon.clone(),
+                                        kind: "token-trade".to_string(),
+                                        original_amount: None,
+                                        inscribed_height: block.height,
+                                        current_owner_address: to_addr.clone(),
+                                        consumed_height: None,
+                                    },
+                                ));
+                            }
+                            TapEnvelope::Control(cp) => {
+                                let Some(addr) = to_addr.as_deref().and_then(normalize_address)
+                                else {
+                                    continue;
+                                };
+                                ordered_reveals.push(OrderedTapOp::Control(
+                                    order_key,
+                                    ControlInscribe {
+                                        inscription_id: insc_id.clone(),
+                                        ticker: "dmt-nat".to_string(),
+                                        address: addr.as_str().to_string(),
+                                        op: cp.op,
+                                    },
+                                ));
+                                let reveal_value = txv
+                                    .tx
+                                    .output
+                                    .get(landing_vout)
+                                    .map(|o| o.value.to_sat())
+                                    .unwrap_or(0);
+                                fresh_carriers.push((
+                                    OutPoint {
+                                        txid: txv.txid,
+                                        vout: landing_vout as u32,
+                                    },
+                                    TrackedCarrier {
+                                        inscription: TrackedInscription {
+                                            inscription_id: insc_id.clone(),
+                                            ticker: tick_canon.clone(),
+                                            kind: InscriptionKind::Control,
+                                            sequence_rank,
+                                        },
+                                        offset_in_outpoint: landing_offset,
+                                        outpoint_value_sats: reveal_value,
+                                    },
+                                    to_addr.clone(),
+                                ));
+                                inscription_rows.push((
+                                    insc_id,
+                                    InscriptionIndex {
+                                        ticker: tick_canon.clone(),
+                                        kind: "control".to_string(),
                                         original_amount: None,
                                         inscribed_height: block.height,
                                         current_owner_address: to_addr.clone(),
@@ -970,53 +1503,6 @@ impl Syncer {
                                 ));
                             }
                         }
-                    }
-                    TapEnvelope::Control(cp) => {
-                        let Some(_) = deployments.get(tick_canon.as_str()) else {
-                            continue;
-                        };
-                        let Some(addr) = to_addr.as_deref().and_then(normalize_address) else {
-                            continue;
-                        };
-                        control_inscribes.push(ControlInscribe {
-                            inscription_id: insc_id.clone(),
-                            ticker: tick_canon.clone(),
-                            address: addr.as_str().to_string(),
-                            op: cp.op,
-                        });
-                        let reveal_value = txv
-                            .tx
-                            .output
-                            .get(landing_vout)
-                            .map(|o| o.value.to_sat())
-                            .unwrap_or(0);
-                        fresh_carriers.push((
-                            OutPoint {
-                                txid: txv.txid,
-                                vout: landing_vout as u32,
-                            },
-                            TrackedCarrier {
-                                inscription: TrackedInscription {
-                                    inscription_id: insc_id.clone(),
-                                    ticker: tick_canon.clone(),
-                                    kind: InscriptionKind::Control,
-                                },
-                                offset_in_outpoint: landing_offset,
-                                outpoint_value_sats: reveal_value,
-                            },
-                            to_addr.clone(),
-                        ));
-                        inscription_rows.push((
-                            insc_id,
-                            InscriptionIndex {
-                                ticker: tick_canon.clone(),
-                                kind: "control".to_string(),
-                                original_amount: None,
-                                inscribed_height: block.height,
-                                current_owner_address: to_addr.clone(),
-                                consumed_height: None,
-                            },
-                        ));
                     }
                 }
             }
@@ -1025,18 +1511,64 @@ impl Syncer {
             // outputs, so nothing this tx just inscribed can be moved
             // by this tx. Skip the RPC round-trip when no input matches
             // a tracked outpoint.
-            let spends_tracked = txv
-                .tx
-                .input
-                .iter()
-                .any(|i| tracker.has(&i.previous_output));
+            let spends_tracked = txv.tx.input.iter().any(|i| tracker.has(&i.previous_output));
             if spends_tracked {
                 let input_values = self
                     .load_input_values(&txv.tx, &tracker, &block_utxos)
                     .await?;
                 let tx_moves = tracker.apply_tx(&txv.tx, &input_values);
                 for m in tx_moves {
-                    moves.push((tx_index, m));
+                    match m {
+                        TrackerMove::Burned {
+                            inscription,
+                            from,
+                            reason: BurnReason::IntoFees { fee_offset },
+                        } => {
+                            if fee_prefixes.is_none() {
+                                fee_prefixes =
+                                    Some(self.compute_fee_prefixes(block, &block_utxos).await?);
+                            }
+                            let prefix_before = fee_prefixes
+                                .as_ref()
+                                .and_then(|prefixes| prefixes.get(tx_index as usize).copied())
+                                .unwrap_or(0);
+                            let mapped = map_fee_flotsam_to_coinbase(
+                                block,
+                                inscription,
+                                from,
+                                prefix_before,
+                                fee_offset,
+                            );
+                            if let TrackerMove::Moved {
+                                inscription,
+                                to,
+                                to_offset,
+                                to_outpoint_value_sats,
+                                ..
+                            } = &mapped
+                            {
+                                tracker.insert(
+                                    *to,
+                                    TrackedCarrier {
+                                        inscription: inscription.clone(),
+                                        offset_in_outpoint: *to_offset,
+                                        outpoint_value_sats: *to_outpoint_value_sats,
+                                    },
+                                );
+                            }
+                            self.mark_tracker_move_dirty(&mapped);
+                            // ord-tap processes coinbase last
+                            // (`skip(1).chain(take(1))`). Fee-fallen
+                            // inscriptions therefore settle to the
+                            // block coinbase after all non-coinbase txs,
+                            // not at the spending tx's position.
+                            moves.push((block.txs.len() as u32, mapped));
+                        }
+                        other => {
+                            self.mark_tracker_move_dirty(&other);
+                            moves.push((tx_index, other));
+                        }
+                    }
                 }
             }
 
@@ -1048,6 +1580,7 @@ impl Syncer {
             // and the recipient no credit.
             for (outpoint, carrier, _addr) in &fresh_carriers[carriers_before..] {
                 tracker.insert(*outpoint, carrier.clone());
+                self.mark_tracker_dirty(*outpoint);
             }
         }
 
@@ -1100,125 +1633,125 @@ impl Syncer {
         let mut events: Vec<LedgerEvent> = Vec::new();
         let block_hash = block.hash.to_string();
 
-        // (Deploys are not auto-registered — v0.1.0 indexes only the
-        // NAT deployment, which is seeded at startup.)
-
-        // (Transfer-inscribe resolution moved below the settlement /
-        //  mint / coinbase / auth-redeem phases so it reads the LIVE
-        //  post-those-events wallet state, matching ord-tap's
-        //  tx-index-ordered traversal. Same-block credits via a
-        //  transfer-settle, token-send-execute, auth-redeem, mint, or
-        //  coinbase at a lower tx_index now count toward the
-        //  inscribing wallet's available balance.)
-
-        // 2b. Token-send reveals: register pending_sends rows + emit
-        //     TokenSendInscribeAdmitted. Balance movement happens later
-        //     at move time.
-        for sr in send_reveals {
-            {
-                let mut table = wtx.open_table(tables::PENDING_SENDS)?;
-                let row = tables::PendingSend {
-                    creator: sr.creator.clone(),
-                    inscribed_height: block.height,
-                    items: sr.items.clone(),
-                    consumed_height: None,
-                };
-                table.insert(sr.inscription_id.as_str(), encode(&row)?.as_slice())?;
+        // 1. Standard TAP token deployments.
+        for dr in token_deploy_reveals {
+            if !ticker_is_valid_at_height(&dr.payload.ticker, block.height) {
+                continue;
             }
-            let total_amount: u128 = sr.items.iter().map(|i| i.amount).sum();
+            if deployments.contains_key(dr.payload.ticker.as_str()) {
+                continue;
+            }
+            let dep = Deployment {
+                ticker: dr.payload.ticker.clone(),
+                deploy_inscription_id: dr.inscription_id.clone(),
+                dmt: false,
+                element_inscription_id: String::new(),
+                element_field: crate::protocol::element::ElementField::Bits,
+                dt: None,
+                dim: None,
+                bits_mode: crate::protocol::bits::BitsMode::RawHex,
+                decimals: dr.payload.decimals,
+                mint_limit: dr.payload.mint_limit,
+                privilege_auth: dr.payload.prv.clone(),
+                activation_height: block.height,
+                coinbase_activation: None,
+                miner_transfer_activation: None,
+                max_supply: dr.payload.max_supply,
+                registered_at: occurred_at,
+            };
+            {
+                let mut table = wtx.open_table(DEPLOYMENTS)?;
+                table.insert(dep.ticker.as_str(), encode(&dep)?.as_slice())?;
+            }
+            deployments.insert(dep.ticker.as_str().to_string(), dep.clone());
             events.push(self.new_event(
-                "nat",
-                EventFamily::Send,
-                EventType::TokenSendInscribeAdmitted,
+                dep.ticker.as_str(),
+                EventFamily::Deploy,
+                EventType::DmtDeployRegistered,
                 block,
                 occurred_at,
-                Some(sr.tx_index),
-                Some(sr.inscription_id),
-                Some(sr.creator),
+                Some(dr.tx_index),
+                Some(dr.inscription_id),
+                Some(dr.owner),
                 None,
                 EventDelta::default(),
                 serde_json::json!({
-                    "item_count": sr.items.len(),
-                    "total_amount": total_amount.to_string(),
+                    "max": dep.max_supply.to_string(),
+                    "lim": dep.mint_limit.to_string(),
+                    "dec": dep.decimals,
+                    "dmt": false,
                 }),
                 &block_hash,
             ));
         }
 
-        // 2c. Token-auth create/cancel reveals: store accumulator + emit
-        //     lifecycle event. Signature verification is deferred to
-        //     move time for create; cancel fires at move as well.
-        for ar in auth_reveals {
-            {
-                let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
-                let row = tables::PendingAuth {
-                    creator: ar.creator.clone(),
-                    inscribed_height: block.height,
-                    form: ar.form.clone(),
-                    consumed_height: None,
-                };
-                table.insert(ar.inscription_id.as_str(), encode(&row)?.as_slice())?;
-            }
-            let et = match &ar.form {
-                tables::PendingAuthForm::Create { .. } => EventType::TokenAuthCreateInscribed,
-                tables::PendingAuthForm::Cancel { .. } => EventType::TokenAuthCancelInscribed,
+        // 1b. Standard TAP token mints.
+        for mr in token_mint_reveals {
+            let ticker = mr.payload.ticker.as_str().to_string();
+            let Some(dep) = deployments.get(&ticker) else {
+                continue;
             };
+            if dep.dmt || dep.privilege_auth.is_some() {
+                continue;
+            }
+            let Ok(mut amount) = parse_scaled_u128(&mr.payload.amount_raw, dep.decimals) else {
+                continue;
+            };
+            let total = read_mint_total(wtx, &ticker)?;
+            if dep.mint_limit > 0 && amount > dep.mint_limit {
+                events.push(self.new_event(
+                    &ticker,
+                    EventFamily::Mint,
+                    EventType::DmtMintDuplicateRejected,
+                    block,
+                    occurred_at,
+                    Some(mr.tx_index),
+                    Some(mr.inscription_id),
+                    Some(mr.owner),
+                    None,
+                    EventDelta::default(),
+                    serde_json::json!({ "reason": "limit_exceeded" }),
+                    &block_hash,
+                ));
+                continue;
+            }
+            let remaining = dep.max_supply.saturating_sub(total);
+            if amount > remaining {
+                amount = remaining;
+            }
+            if amount == 0 {
+                continue;
+            }
+            let a = i128::try_from(amount).unwrap_or(i128::MAX);
+            apply_wallet_delta(wtx, &ticker, &mr.owner, a, a, 0, 0, occurred_at)?;
+            bump_mint_total(wtx, &ticker, amount)?;
             events.push(self.new_event(
-                "nat",
-                EventFamily::Auth,
-                et,
+                &ticker,
+                EventFamily::Mint,
+                EventType::DmtMintCredit,
                 block,
                 occurred_at,
-                Some(ar.tx_index),
-                Some(ar.inscription_id),
-                Some(ar.creator),
+                Some(mr.tx_index),
+                Some(mr.inscription_id),
+                Some(mr.owner),
                 None,
-                EventDelta::default(),
-                serde_json::json!({}),
+                EventDelta {
+                    delta_total: a,
+                    delta_available: a,
+                    ..Default::default()
+                },
+                serde_json::json!({ "amount": amount.to_string(), "standard_tap": true }),
                 &block_hash,
             ));
         }
 
-        // 2d. Token-auth redeem reveals: execute balance moves at
-        //     reveal time (ord-tap `/tmp/ot_auth.rs:42-102`).
-        for rr in auth_redeem_reveals {
-            self.process_auth_redeem(wtx, rr, block, occurred_at, &block_hash, &mut events)?;
-        }
-
-        // 3. Control inscribes
-        for c in control_inscribes {
-            {
-                let mut table = wtx.open_table(PENDING_CONTROLS)?;
-                let v = StoredPendingControl {
-                    ticker: c.ticker.clone(),
-                    address: c.address.clone(),
-                    op: match c.op {
-                        ControlOp::Block => "block".to_string(),
-                        ControlOp::Unblock => "unblock".to_string(),
-                    },
-                    inscribed_height: block.height,
-                };
-                table.insert(c.inscription_id.as_str(), encode(&v)?.as_slice())?;
-            }
-            let et = match c.op {
-                ControlOp::Block => EventType::BlockTransferablesInscribed,
-                ControlOp::Unblock => EventType::UnblockTransferablesInscribed,
-            };
-            events.push(self.new_event(
-                &c.ticker,
-                EventFamily::Control,
-                et,
-                block,
-                occurred_at,
-                None,
-                Some(c.inscription_id),
-                Some(c.address),
-                None,
-                EventDelta::default(),
-                serde_json::json!({}),
-                &block_hash,
-            ));
-        }
+        // (Transfer-inscribe resolution moved below the settlement /
+        //  mint / coinbase / auth-redeem phases so it reads the LIVE
+        //  post-those-events wallet state, matching Tapalytics'
+        //  tx-index-ordered traversal. Same-block credits via a
+        //  transfer-settle, token-send-execute, auth-redeem, mint, or
+        //  coinbase at a lower tx_index now count toward the
+        //  inscribing wallet's available balance.)
 
         // 4. Mints
         for (ticker, res) in mint_resolutions {
@@ -1295,7 +1828,11 @@ impl Syncer {
             }
         }
 
-        // 5. Coinbase distribution
+        // 5. Coinbase distribution. Tapalytics makes DMT/NAT coinbase
+        //    rewards available to TAP operations in the same block. This
+        //    is required for block 927124's ba529... token-send: without
+        //    the same-block reward, the creator is short by exactly
+        //    200,000,000 units and the send is incorrectly skipped.
         for (ticker, shares) in coinbase_shares_per_ticker {
             for share in shares {
                 if share.share_amount == 0 {
@@ -1332,24 +1869,23 @@ impl Syncer {
                     // reward credit if it wasn't already set; an
                     // explicit `unblock-transferables` clears it, and
                     // subsequent credits do NOT re-block.
-                    let was_blocked = wallet_is_blocked(&wtx, &ticker, &addr)?;
                     apply_wallet_delta(&wtx, &ticker, &addr, a, a, 0, 0, occurred_at)?;
-                    // Coinbase issuance counts toward the supply cap —
+                    // Coinbase issuance counts toward the supply cap -
                     // ord-tap's `dc/<tick>` counter decrements on both
                     // `dmt-mint` admits and DMT-reward coinbase credits.
                     bump_mint_total(&wtx, &ticker, share.share_amount)?;
+                    let mut did_lock_now = false;
                     if share.should_lock_on_first_credit {
-                        // dmtrwd marker is PERMANENT — idempotent put.
-                        // Needed for the transfer-execution shield
-                        // (height >= 942,002), which invalidates
-                        // outstanding transferables from any past
-                        // miner even after they unblock themselves.
-                        dmt_reward_mark(&wtx, &addr)?;
-                        if !was_blocked {
+                        // dmtrwd marker is PERMANENT. ord-tap auto-blocks
+                        // only when the marker is first created; later
+                        // reward credits must not re-block a miner who
+                        // deliberately unblocked.
+                        let inserted_mark = dmt_reward_mark(&wtx, &addr)?;
+                        if inserted_mark {
                             set_wallet_locked(&wtx, &ticker, &addr)?;
+                            did_lock_now = true;
                         }
                     }
-                    let did_lock_now = share.should_lock_on_first_credit && !was_blocked;
                     events.push(self.new_event(
                         &ticker,
                         EventFamily::Coinbase,
@@ -1379,144 +1915,279 @@ impl Syncer {
             }
         }
 
-        // 5b. Transfer inscribes — admitted between step-5 credits and
-        //     step-6 settlements, using a two-pass settle to handle
-        //     BOTH same-block credit-then-inscribe AND same-block
-        //     inscribe-then-spend ordering at once. Ord-tap processes
-        //     envelopes and moves in tx-index order; a simple "all
-        //     settles before all admits" breaks same-block
-        //     inscribe+spend (settle can't find the just-written
-        //     valid_transfer), and a simple "all admits before all
-        //     settles" breaks credit-then-inscribe (admit can't see
-        //     the yet-to-land credit). Two passes get both:
-        //
-        //       pass 1 (BEFORE admit): settle only the moves whose
-        //           VALID_TRANSFERS already exists at block entry —
-        //           i.e. the inscribe happened in a PRIOR block.
-        //           Credits from these settlements land in
-        //           WALLET_STATE before admission runs.
-        //       step 5b: admit new inscribes against LIVE balance;
-        //           write VALID_TRANSFERS for successes.
-        //       pass 2 (AFTER admit): settle the moves whose
-        //           VALID_TRANSFERS was just written — i.e.
-        //           same-block inscribe+spend.
-        //
-        //     Non-transfer moves (Control / Send / Auth / Mint / Burn)
-        //     all go in pass 1 — they don't gate on VALID_TRANSFERS.
-        let (pass1_moves, pass2_moves) = {
-            let vtable = wtx.open_table(VALID_TRANSFERS)?;
-            let mut p1: Vec<(u32, TrackerMove)> = Vec::with_capacity(moves.len());
-            let mut p2: Vec<(u32, TrackerMove)> = Vec::new();
-            for (tx_index, mv) in moves.drain(..) {
-                let defer = matches!(
-                    &mv,
-                    TrackerMove::Moved { inscription, .. }
-                        if matches!(inscription.kind, InscriptionKind::TokenTransfer)
-                            && vtable.get(inscription.inscription_id.as_str())?.is_none()
-                );
-                if defer {
-                    p2.push((tx_index, mv));
-                } else {
-                    p1.push((tx_index, mv));
-                }
-            }
-            (p1, p2)
-        };
-        // Execute pass 1 (settles with pre-existing VALID_TRANSFERS + all non-transfer moves)
-        self.apply_moves(wtx, pass1_moves, block, occurred_at, &block_hash, &mut events)?;
-        let avail_snapshot = self.snapshot_available_from(wtx, &transfer_inscribes_unresolved)?;
-        let blocked_senders =
-            self.snapshot_blocked_senders_from(wtx, &transfer_inscribes_unresolved)?;
-        let inscribe_resolutions = resolve_transfer_inscribes(
-            transfer_inscribes_unresolved,
-            &avail_snapshot,
-            &blocked_senders,
+        // 6. Ordered TAP operations. ord-tap mutates token state as
+        //     inscriptions and transfers are encountered in transaction
+        //     order; batching all moves before or after all transfer
+        //     creates changes same-block balance visibility.
+        let mut ordered_ops: Vec<OrderedTapOp> = Vec::with_capacity(
+            moves.len()
+                + ordered_reveals.len()
+                + auth_redeem_reveals.len()
+                + transfer_inscribes_unresolved.len(),
         );
-        for r in inscribe_resolutions {
-            match r {
-                InscribeResolution::Admitted {
-                    inscription_id,
-                    ticker,
-                    address,
-                    amount,
-                    inscribed_height,
-                    tx_index,
-                } => {
-                    {
-                        let mut table = wtx.open_table(VALID_TRANSFERS)?;
-                        let v = ValidTransfer {
-                            ticker: ticker.clone(),
-                            sender: address.as_str().to_string(),
-                            amount,
-                            inscribed_height,
-                            consumed_height: None,
-                        };
-                        table.insert(inscription_id.as_str(), encode(&v)?.as_slice())?;
-                    }
-                    {
-                        let mut idx = wtx.open_table(TRANSFERABLES_BY_SENDER)?;
-                        idx.insert(
-                            (ticker.as_str(), address.as_str(), inscription_id.as_str()),
-                            1u8,
-                        )?;
-                    }
-                    let a = i128::try_from(amount).unwrap_or(i128::MAX);
-                    apply_wallet_delta(&wtx, &ticker, address.as_str(), 0, -a, a, 0, occurred_at)?;
-                    events.push(self.new_event(
-                        &ticker,
-                        EventFamily::Transfer,
-                        EventType::TokenTransferInscribeAdmitted,
-                        block,
-                        occurred_at,
-                        Some(tx_index),
-                        Some(inscription_id),
-                        Some(address.as_str().to_string()),
-                        None,
-                        EventDelta {
-                            delta_available: -a,
-                            delta_transferable: a,
-                            ..Default::default()
-                        },
-                        serde_json::json!({ "amount": amount.to_string() }),
-                        &block_hash,
-                    ));
+        ordered_ops.extend(ordered_reveals.into_iter());
+        ordered_ops.extend(
+            moves
+                .drain(..)
+                .map(|(tx_index, mv)| OrderedTapOp::Move { tx_index, mv }),
+        );
+        ordered_ops.extend(
+            auth_redeem_reveals
+                .into_iter()
+                .map(OrderedTapOp::AuthRedeem),
+        );
+        ordered_ops.extend(
+            transfer_inscribes_unresolved
+                .into_iter()
+                .map(OrderedTapOp::TransferInscribe),
+        );
+        ordered_ops.sort_by_key(ordered_reveal_key);
+
+        for op in ordered_ops {
+            match op {
+                OrderedTapOp::DmtElement(_, er) => {
+                    self.process_dmt_element(wtx, er, block, occurred_at)?;
                 }
-                InscribeResolution::Skipped {
-                    inscription_id,
-                    ticker,
-                    address,
-                    attempted_amount,
-                    snapshot_available,
-                    inscribed_height: _,
-                    tx_index,
-                    reason,
-                } => {
-                    events.push(self.new_event(
-                        &ticker,
-                        EventFamily::Transfer,
-                        EventType::TokenTransferSkippedSemantic,
+                OrderedTapOp::DmtDeploy(_, dr) => {
+                    self.process_dmt_deploy(
+                        wtx,
+                        dr,
                         block,
                         occurred_at,
-                        Some(tx_index),
-                        Some(inscription_id),
-                        Some(address.as_str().to_string()),
-                        None,
-                        EventDelta::default(),
-                        serde_json::json!({
-                            "amount": attempted_amount.to_string(),
-                            "available": snapshot_available.to_string(),
-                            "reason": reason,
-                        }),
                         &block_hash,
-                    ));
+                        &mut deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::DmtMint(_, mr) => {
+                    self.process_dmt_mint(
+                        wtx,
+                        mr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::TokenDeploy(_, dr) => {
+                    self.process_token_deploy(
+                        wtx,
+                        dr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &mut deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::TokenMint(_, mr) => {
+                    self.process_token_mint(
+                        wtx,
+                        mr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::SendReveal(_, sr) => {
+                    self.process_send_reveal(
+                        wtx,
+                        sr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::TradeReveal(_, tr) => {
+                    self.process_trade_reveal(
+                        wtx,
+                        tr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::AuthReveal(_, ar) => {
+                    self.process_auth_reveal(
+                        wtx,
+                        ar,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &deployments,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::PrivilegeAuthReveal(_, pr) => {
+                    self.process_privilege_auth_reveal(wtx, pr, block)?;
+                }
+                OrderedTapOp::Control(_, c) => {
+                    self.process_control_reveal(
+                        wtx,
+                        c,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::Move { tx_index, mv } => {
+                    self.apply_moves(
+                        wtx,
+                        vec![(tx_index, mv)],
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::AuthRedeem(rr) => {
+                    self.process_auth_redeem(
+                        wtx,
+                        rr,
+                        block,
+                        occurred_at,
+                        &block_hash,
+                        &mut events,
+                    )?;
+                }
+                OrderedTapOp::TransferInscribe(ti) => {
+                    let Some(dep) = deployments.get(ti.ticker.as_str()) else {
+                        continue;
+                    };
+                    if !raw_transfer_tick_matches_deployment_kind(&ti.raw_ticker, dep.dmt) {
+                        continue;
+                    }
+                    let Ok(amount) = parse_scaled_u128(&ti.amount_raw, dep.decimals) else {
+                        continue;
+                    };
+                    if amount == 0 {
+                        continue;
+                    }
+                    let candidates = vec![TransferInscribeCandidate {
+                        inscription_id: ti.inscription_id,
+                        inscription_number: ti.inscription_number,
+                        inscribed_block_height: ti.inscribed_block_height,
+                        ticker: ti.ticker,
+                        address: ti.address,
+                        amount,
+                        tx_index: ti.tx_index,
+                    }];
+                    let balance_snapshot =
+                        self.snapshot_transfer_create_balance_from(wtx, &candidates)?;
+                    let blocked_senders = self.snapshot_blocked_senders_from(wtx, &candidates)?;
+                    let inscribe_resolutions =
+                        resolve_transfer_inscribes(candidates, &balance_snapshot, &blocked_senders);
+                    for r in inscribe_resolutions {
+                        match r {
+                            InscribeResolution::Admitted {
+                                inscription_id,
+                                ticker,
+                                address,
+                                amount,
+                                inscribed_height,
+                                tx_index,
+                            } => {
+                                {
+                                    let mut table = wtx.open_table(VALID_TRANSFERS)?;
+                                    let v = ValidTransfer {
+                                        ticker: ticker.clone(),
+                                        sender: address.as_str().to_string(),
+                                        amount,
+                                        inscribed_height,
+                                        consumed_height: None,
+                                    };
+                                    table
+                                        .insert(inscription_id.as_str(), encode(&v)?.as_slice())?;
+                                }
+                                {
+                                    let mut idx = wtx.open_table(TRANSFERABLES_BY_SENDER)?;
+                                    idx.insert(
+                                        (
+                                            ticker.as_str(),
+                                            address.as_str(),
+                                            inscription_id.as_str(),
+                                        ),
+                                        1u8,
+                                    )?;
+                                }
+                                let a = i128::try_from(amount).unwrap_or(i128::MAX);
+                                reconcile_wallet_available(
+                                    &wtx,
+                                    &ticker,
+                                    address.as_str(),
+                                    occurred_at,
+                                )?;
+                                apply_wallet_delta(
+                                    &wtx,
+                                    &ticker,
+                                    address.as_str(),
+                                    0,
+                                    -a,
+                                    a,
+                                    0,
+                                    occurred_at,
+                                )?;
+                                events.push(self.new_event(
+                                    &ticker,
+                                    EventFamily::Transfer,
+                                    EventType::TokenTransferInscribeAdmitted,
+                                    block,
+                                    occurred_at,
+                                    Some(tx_index),
+                                    Some(inscription_id),
+                                    Some(address.as_str().to_string()),
+                                    None,
+                                    EventDelta {
+                                        delta_available: -a,
+                                        delta_transferable: a,
+                                        ..Default::default()
+                                    },
+                                    serde_json::json!({ "amount": amount.to_string() }),
+                                    &block_hash,
+                                ));
+                            }
+                            InscribeResolution::Skipped {
+                                inscription_id,
+                                ticker,
+                                address,
+                                attempted_amount,
+                                snapshot_balance,
+                                inscribed_height: _,
+                                tx_index,
+                                reason,
+                            } => {
+                                events.push(self.new_event(
+                                    &ticker,
+                                    EventFamily::Transfer,
+                                    EventType::TokenTransferSkippedSemantic,
+                                    block,
+                                    occurred_at,
+                                    Some(tx_index),
+                                    Some(inscription_id),
+                                    Some(address.as_str().to_string()),
+                                    None,
+                                    EventDelta::default(),
+                                    serde_json::json!({
+                                        "amount": attempted_amount.to_string(),
+                                        "balance": snapshot_balance.to_string(),
+                                        "reason": reason,
+                                    }),
+                                    &block_hash,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        // 6. Apply pass-2 moves (same-block inscribe+spend whose
-        //    VALID_TRANSFERS was just written in step 5b). Pass-1
-        //    moves were already applied above before admission.
-        self.apply_moves(wtx, pass2_moves, block, occurred_at, &block_hash, &mut events)?;
 
         // 7. Persist inscription index, carrier map, events, rollups
         {
@@ -1530,8 +2201,11 @@ impl Syncer {
 
         {
             let mut table = wtx.open_table(EVENTS)?;
+            let mut by_id = wtx.open_table(EVENTS_BY_ID)?;
             for ev in &events {
-                table.insert((ev.ticker.as_str(), ev.event_id), encode(ev)?.as_slice())?;
+                let encoded = encode(ev)?;
+                table.insert((ev.ticker.as_str(), ev.event_id), encoded.as_slice())?;
+                by_id.insert(ev.event_id, encoded.as_slice())?;
             }
         }
         {
@@ -1735,17 +2409,72 @@ impl Syncer {
         Ok(out)
     }
 
-    fn load_tracker_from(
-        &self,
-        wtx: &redb::WriteTransaction,
-    ) -> Result<(InscriptionTracker, std::collections::HashSet<String>)> {
+    async fn compute_fee_prefixes(
+        &mut self,
+        block: &BlockView,
+        block_utxos: &HashMap<bitcoin::Txid, Vec<u64>>,
+    ) -> Result<Vec<u64>> {
+        let mut missing: Vec<OutPoint> = Vec::new();
+        for txv in block.txs.iter().skip(1) {
+            for txin in &txv.tx.input {
+                let op = txin.previous_output;
+                if op.is_null() || block_utxos.contains_key(&op.txid) {
+                    continue;
+                }
+                missing.push(op);
+            }
+        }
+
+        let mut fetched: HashMap<bitcoin::Txid, Vec<u64>> = HashMap::new();
+        if !missing.is_empty() {
+            let mut unique_txids: Vec<bitcoin::Txid> = missing.iter().map(|op| op.txid).collect();
+            unique_txids.sort();
+            unique_txids.dedup();
+            let txs = self.rpc.get_raw_transactions_batch(&unique_txids).await?;
+            fetched = unique_txids
+                .into_iter()
+                .zip(txs.into_iter())
+                .filter_map(|(txid, maybe_tx)| {
+                    maybe_tx.map(|tx| (txid, tx.output.iter().map(|o| o.value.to_sat()).collect()))
+                })
+                .collect();
+        }
+
+        let mut prefixes = Vec::with_capacity(block.txs.len());
+        let mut cumulative_fees = 0u64;
+        for (idx, txv) in block.txs.iter().enumerate() {
+            prefixes.push(cumulative_fees);
+            if idx == 0 {
+                continue;
+            }
+            let input_sum = txv.tx.input.iter().fold(0u64, |acc, txin| {
+                let op = txin.previous_output;
+                if op.is_null() {
+                    return acc;
+                }
+                let value = block_utxos
+                    .get(&op.txid)
+                    .and_then(|vals| vals.get(op.vout as usize).copied())
+                    .or_else(|| {
+                        fetched
+                            .get(&op.txid)
+                            .and_then(|vals| vals.get(op.vout as usize).copied())
+                    })
+                    .unwrap_or(0);
+                acc.saturating_add(value)
+            });
+            let output_sum: u64 = txv.tx.output.iter().map(|o| o.value.to_sat()).sum();
+            cumulative_fees = cumulative_fees.saturating_add(input_sum.saturating_sub(output_sum));
+        }
+        Ok(prefixes)
+    }
+
+    fn load_tracker_from(&self, wtx: &redb::WriteTransaction) -> Result<InscriptionTracker> {
         let table = wtx.open_multimap_table(INSCRIPTION_OWNERS)?;
         let mut t = InscriptionTracker::new();
-        let mut keys = std::collections::HashSet::new();
         for row in table.iter()? {
             let (k, values) = row?;
             let key_str = k.value().to_string();
-            keys.insert(key_str.clone());
             let op: OutPoint = match parse_outpoint(&key_str) {
                 Some(op) => op,
                 None => continue,
@@ -1768,8 +2497,11 @@ impl Syncer {
                                 "dmt-mint" => InscriptionKind::Mint,
                                 "token-send" => InscriptionKind::TokenSend,
                                 "token-auth" => InscriptionKind::TokenAuth,
+                                "token-trade" => InscriptionKind::TokenTrade,
+                                "privilege-auth" => InscriptionKind::PrivilegeAuth,
                                 _ => InscriptionKind::Control,
                             },
+                            sequence_rank: owner.sequence_rank,
                         },
                         offset_in_outpoint: owner.offset_in_outpoint,
                         outpoint_value_sats: owner.outpoint_value_sats,
@@ -1777,7 +2509,7 @@ impl Syncer {
                 );
             }
         }
-        Ok((t, keys))
+        Ok(t)
     }
 
     fn load_claimed_blocks_from(
@@ -1797,11 +2529,935 @@ impl Syncer {
         Ok(out)
     }
 
-    fn snapshot_available_from(
+    #[allow(clippy::too_many_arguments)]
+    fn process_token_deploy(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        dr: TokenDeployReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        deployments: &mut HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        if !ticker_is_valid_at_height(&dr.payload.ticker, block.height) {
+            return Ok(());
+        }
+        if dr.payload.prv.is_some()
+            && !is_privilege_auth_active(wtx, dr.payload.prv.as_deref().unwrap())?
+        {
+            return Ok(());
+        }
+        if deployments.contains_key(dr.payload.ticker.as_str()) {
+            return Ok(());
+        }
+        let dep = Deployment {
+            ticker: dr.payload.ticker.clone(),
+            deploy_inscription_id: dr.inscription_id.clone(),
+            dmt: false,
+            element_inscription_id: String::new(),
+            element_field: ElementField::Bits,
+            dt: None,
+            dim: None,
+            bits_mode: crate::protocol::bits::BitsMode::RawHex,
+            decimals: dr.payload.decimals,
+            mint_limit: dr.payload.mint_limit,
+            privilege_auth: dr.payload.prv.clone(),
+            activation_height: block.height,
+            coinbase_activation: None,
+            miner_transfer_activation: None,
+            max_supply: dr.payload.max_supply,
+            registered_at: occurred_at,
+        };
+        {
+            let mut table = wtx.open_table(DEPLOYMENTS)?;
+            table.insert(dep.ticker.as_str(), encode(&dep)?.as_slice())?;
+        }
+        deployments.insert(dep.ticker.as_str().to_string(), dep.clone());
+        events.push(self.new_event(
+            dep.ticker.as_str(),
+            EventFamily::Deploy,
+            EventType::DmtDeployRegistered,
+            block,
+            occurred_at,
+            Some(dr.tx_index),
+            Some(dr.inscription_id),
+            Some(dr.owner),
+            None,
+            EventDelta::default(),
+            serde_json::json!({
+                "max": dep.max_supply.to_string(),
+                "lim": dep.mint_limit.to_string(),
+                "dec": dep.decimals,
+                "dmt": false,
+            }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_token_mint(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        mr: TokenMintReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        deployments: &HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let ticker = mr.payload.ticker.as_str().to_string();
+        let Some(dep) = deployments.get(&ticker) else {
+            return Ok(());
+        };
+        if dep.dmt {
+            return Ok(());
+        }
+        let Ok(mut amount) = parse_scaled_u128(&mr.payload.amount_raw, dep.decimals) else {
+            return Ok(());
+        };
+        let mut fail = false;
+        if dep.mint_limit > 0 && amount > dep.mint_limit {
+            fail = true;
+        }
+        let total = read_mint_total(wtx, &ticker)?;
+        if !fail {
+            let remaining = dep.max_supply.saturating_sub(total);
+            if amount > remaining {
+                amount = remaining;
+            }
+            if amount == 0 {
+                fail = true;
+            }
+        }
+        if !fail {
+            if let Some(prv) = dep.privilege_auth.as_deref() {
+                let ok = self.verify_privilege_mint(
+                    wtx,
+                    prv,
+                    mr.payload.prv.as_ref(),
+                    "tap",
+                    "token-mint",
+                    mr.payload.ticker.as_str(),
+                    &mr.payload.amount_raw,
+                    None,
+                    mr.payload.dta.as_deref(),
+                    &mr.owner,
+                )?;
+                if !ok {
+                    fail = true;
+                }
+            }
+        }
+        if fail {
+            events.push(self.new_event(
+                &ticker,
+                EventFamily::Mint,
+                EventType::DmtMintDuplicateRejected,
+                block,
+                occurred_at,
+                Some(mr.tx_index),
+                Some(mr.inscription_id),
+                Some(mr.owner),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "mint_failed" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        let a = i128::try_from(amount).unwrap_or(i128::MAX);
+        apply_wallet_delta(wtx, &ticker, &mr.owner, a, a, 0, 0, occurred_at)?;
+        bump_mint_total(wtx, &ticker, amount)?;
+        events.push(self.new_event(
+            &ticker,
+            EventFamily::Mint,
+            EventType::DmtMintCredit,
+            block,
+            occurred_at,
+            Some(mr.tx_index),
+            Some(mr.inscription_id),
+            Some(mr.owner),
+            None,
+            EventDelta {
+                delta_total: a,
+                delta_available: a,
+                ..Default::default()
+            },
+            serde_json::json!({ "amount": amount.to_string(), "standard_tap": true }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    fn process_dmt_element(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        er: DmtElementReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let sig = format!(
+            "{}{}",
+            er.payload.pattern.clone().unwrap_or_default(),
+            er.payload.field_token
+        );
+        {
+            let table = wtx.open_table(tables::DMT_ELEMENTS)?;
+            if table.get(er.payload.name.as_str())?.is_some() {
+                return Ok(());
+            }
+        }
+        {
+            let table = wtx.open_table(tables::DMT_ELEMENT_SIGNATURES)?;
+            if table.get(sig.as_str())?.is_some() {
+                return Ok(());
+            }
+        }
+        let rec = tables::DmtElementRecord {
+            name: er.payload.name.clone(),
+            pattern: er.payload.pattern,
+            field: match er.payload.field {
+                ElementField::BlockHeight => 4,
+                ElementField::Nonce => 10,
+                ElementField::Bits => 11,
+            },
+            inscription_id: er.inscription_id.clone(),
+            inscribed_height: block.height,
+            txid: er.txid,
+            vout: er.landing_vout,
+            address: er.owner,
+            timestamp: occurred_at.timestamp(),
+        };
+        {
+            let mut table = wtx.open_table(tables::DMT_ELEMENTS)?;
+            table.insert(rec.name.as_str(), encode(&rec)?.as_slice())?;
+        }
+        {
+            let mut table = wtx.open_table(tables::DMT_ELEMENT_BY_INSCRIPTION)?;
+            table.insert(er.inscription_id.as_str(), rec.name.as_str())?;
+        }
+        {
+            let mut table = wtx.open_table(tables::DMT_ELEMENT_SIGNATURES)?;
+            table.insert(sig.as_str(), 1u8)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_dmt_deploy(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        dr: DmtDeployReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        deployments: &mut HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        if !ticker_is_valid_at_height(&dr.payload.ticker, block.height) {
+            return Ok(());
+        }
+        let ticker = dmt_effective_ticker(dr.payload.ticker.as_str());
+        if deployments.contains_key(ticker.as_str()) {
+            return Ok(());
+        }
+        if let Some(prv) = dr.payload.prv.as_deref() {
+            if !is_privilege_auth_active(wtx, prv)? {
+                return Ok(());
+            }
+        }
+        let elem_name = {
+            let table = wtx.open_table(tables::DMT_ELEMENT_BY_INSCRIPTION)?;
+            let Some(v) = table.get(dr.payload.element_inscription_id.as_str())? else {
+                return Ok(());
+            };
+            v.value().to_string()
+        };
+        let elem: tables::DmtElementRecord = {
+            let table = wtx.open_table(tables::DMT_ELEMENTS)?;
+            let Some(v) = table.get(elem_name.as_str())? else {
+                return Ok(());
+            };
+            decode(v.value())?
+        };
+        if elem.pattern.is_some() {
+            match (elem.field, dr.payload.dt.as_deref()) {
+                (4 | 10, Some("n")) => {}
+                (11, Some("n" | "h")) => {}
+                _ => return Ok(()),
+            }
+        }
+        let Ok(ticker_norm) = crate::protocol::ticker::normalize_ticker(&ticker) else {
+            return Ok(());
+        };
+        let dep = Deployment {
+            ticker: ticker_norm,
+            deploy_inscription_id: dr.inscription_id.clone(),
+            dmt: true,
+            element_inscription_id: dr.payload.element_inscription_id.clone(),
+            element_field: match elem.field {
+                4 => ElementField::BlockHeight,
+                10 => ElementField::Nonce,
+                _ => ElementField::Bits,
+            },
+            dt: dr.payload.dt.clone(),
+            dim: dr.payload.dim.clone(),
+            bits_mode: crate::protocol::bits::BitsMode::RawHex,
+            decimals: 0,
+            mint_limit: u64::MAX as u128,
+            privilege_auth: dr.payload.prv.clone(),
+            activation_height: block.height,
+            coinbase_activation: if ticker == "dmt-nat" {
+                Some(crate::ledger::deploy::NAT_COINBASE_ACTIVATION)
+            } else {
+                None
+            },
+            miner_transfer_activation: if ticker == "dmt-nat" {
+                Some(crate::ledger::deploy::NAT_MINER_TRANSFER_ACTIVATION)
+            } else {
+                None
+            },
+            max_supply: u64::MAX as u128,
+            registered_at: occurred_at,
+        };
+        {
+            let mut table = wtx.open_table(DEPLOYMENTS)?;
+            table.insert(dep.ticker.as_str(), encode(&dep)?.as_slice())?;
+        }
+        {
+            let mut table = wtx.open_table(tables::DMT_DEPLOY_BY_INSCRIPTION)?;
+            table.insert(dr.inscription_id.as_str(), dep.ticker.as_str())?;
+        }
+        deployments.insert(dep.ticker.as_str().to_string(), dep.clone());
+        events.push(self.new_event(
+            dep.ticker.as_str(),
+            EventFamily::Deploy,
+            EventType::DmtDeployRegistered,
+            block,
+            occurred_at,
+            None,
+            Some(dr.inscription_id),
+            Some(dr.owner),
+            None,
+            EventDelta::default(),
+            serde_json::json!({ "dmt": true, "elem": dep.element_inscription_id }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_dmt_mint(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        mr: DmtMintReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        deployments: &HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let ticker = dmt_effective_ticker(mr.payload.ticker.as_str());
+        let Some(dep) = deployments.get(ticker.as_str()) else {
+            return Ok(());
+        };
+        if !dep.dmt || ticker == "dmt-nat" {
+            return Ok(());
+        }
+        if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+            && mr.payload.block_raw != mr.payload.block_number.to_string()
+        {
+            return Ok(());
+        }
+        if mr.payload.block_number > block.height {
+            return Ok(());
+        }
+        if mr
+            .payload
+            .deployment_inscription_id
+            .as_deref()
+            .filter(|d| *d == dep.deploy_inscription_id)
+            .is_none()
+        {
+            return Ok(());
+        }
+        {
+            let table = wtx.open_table(tables::DMT_MINT_BLOCKS)?;
+            if table
+                .get((ticker.as_str(), mr.payload.block_number))?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        let elem_name = {
+            let table = wtx.open_table(tables::DMT_ELEMENT_BY_INSCRIPTION)?;
+            let Some(v) = table.get(dep.element_inscription_id.as_str())? else {
+                return Ok(());
+            };
+            v.value().to_string()
+        };
+        let elem: tables::DmtElementRecord = {
+            let table = wtx.open_table(tables::DMT_ELEMENTS)?;
+            let Some(v) = table.get(elem_name.as_str())? else {
+                return Ok(());
+            };
+            decode(v.value())?
+        };
+        let value_str = match elem.field {
+            4 => mr.blk_repr.clone(),
+            10 => mr.referenced_nonce.to_string(),
+            11 if elem.pattern.is_some() && dep.dt.as_deref() == Some("h") => {
+                format!("{:x}", mr.referenced_bits)
+            }
+            11 => mr.referenced_bits.to_string(),
+            _ => return Ok(()),
+        };
+        let mut amount = if let Some(pattern) = elem.pattern.as_deref() {
+            let re = match regex::Regex::new(pattern) {
+                Ok(re) => re,
+                Err(_) => return Ok(()),
+            };
+            re.find_iter(&value_str).count() as u128
+        } else {
+            value_str.parse::<u128>().unwrap_or(0)
+        };
+        if dep.mint_limit > 0 && amount > dep.mint_limit {
+            return Ok(());
+        }
+        let total = read_mint_total(wtx, &ticker)?;
+        let remaining = dep.max_supply.saturating_sub(total);
+        if amount > remaining {
+            amount = remaining;
+        }
+        if amount == 0 {
+            return Ok(());
+        }
+        if let Some(prv) = dep.privilege_auth.as_deref() {
+            let ok = self.verify_privilege_mint(
+                wtx,
+                prv,
+                mr.payload.prv.as_ref(),
+                "tap",
+                "dmt-mint",
+                mr.payload.ticker.as_str(),
+                &mr.blk_repr,
+                mr.payload.deployment_inscription_id.as_deref(),
+                mr.payload.dta.as_deref(),
+                &mr.owner,
+            )?;
+            if !ok {
+                return Ok(());
+            }
+        }
+        {
+            let mut table = wtx.open_table(tables::DMT_MINT_BLOCKS)?;
+            table.insert((ticker.as_str(), mr.payload.block_number), 1u8)?;
+        }
+        {
+            let mut table = wtx.open_table(MINT_CLAIMS)?;
+            let v = MintClaim {
+                winning_inscription_id: mr.inscription_id.clone(),
+                winning_inscription_number: 0,
+                inscribed_height: block.height,
+                amount,
+            };
+            table.insert(
+                (ticker.as_str(), mr.payload.block_number),
+                encode(&v)?.as_slice(),
+            )?;
+        }
+        let a = i128::try_from(amount).unwrap_or(i128::MAX);
+        apply_wallet_delta(wtx, &ticker, &mr.owner, a, a, 0, 0, occurred_at)?;
+        bump_mint_total(wtx, &ticker, amount)?;
+        events.push(self.new_event(
+            &ticker,
+            EventFamily::Mint,
+            EventType::DmtMintCredit,
+            block,
+            occurred_at,
+            None,
+            Some(mr.inscription_id),
+            Some(mr.owner),
+            None,
+            EventDelta {
+                delta_total: a,
+                delta_available: a,
+                ..Default::default()
+            },
+            serde_json::json!({ "blk": mr.payload.block_number, "amount": amount.to_string(), "dmt": true }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    fn process_privilege_auth_reveal(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        pr: PendingPrivilegeAuthReveal,
+        block: &BlockView,
+    ) -> Result<()> {
+        let mut table = wtx.open_table(tables::PENDING_PRIVILEGE_AUTHS)?;
+        let row = tables::PendingPrivilegeAuth {
+            creator: pr.creator,
+            inscribed_height: block.height,
+            form: pr.form,
+            consumed_height: None,
+        };
+        table.insert(pr.inscription_id.as_str(), encode(&row)?.as_slice())?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_send_reveal(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        sr: PendingSendReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        _deployments: &HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        if is_dmt_reward_address_at_height(wtx, sr.creator.as_str(), block.height)? {
+            return Ok(());
+        }
+        if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+            && sr.payload.items.iter().any(|it| it.amount_was_number)
+        {
+            return Ok(());
+        }
+        if sr
+            .payload
+            .items
+            .iter()
+            .any(|it| !is_valid_tap_address_at_height(it.recipient.as_str(), block.height))
+        {
+            return Ok(());
+        }
+        let mut items = Vec::new();
+        for it in sr.payload.items.iter() {
+            let ticker = canonical_ticker(it.ticker.as_str());
+            items.push(tables::PendingSendItem {
+                ticker,
+                recipient: it.recipient.as_str().to_string(),
+                amount: 0,
+                amount_raw: it.amount_raw.clone(),
+                amount_was_number: it.amount_was_number,
+                dta: it.dta.clone(),
+            });
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut table = wtx.open_table(tables::PENDING_SENDS)?;
+            let row = tables::PendingSend {
+                creator: sr.creator.clone(),
+                inscribed_height: block.height,
+                items: items.clone(),
+                consumed_height: None,
+            };
+            table.insert(sr.inscription_id.as_str(), encode(&row)?.as_slice())?;
+        }
+        events.push(self.new_event(
+            sr.event_ticker.as_str(),
+            EventFamily::Send,
+            EventType::TokenSendInscribeAdmitted,
+            block,
+            occurred_at,
+            Some(sr.tx_index),
+            Some(sr.inscription_id),
+            Some(sr.creator),
+            None,
+            EventDelta::default(),
+            serde_json::json!({
+                "item_count": items.len(),
+            }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_trade_reveal(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        tr: PendingTradeReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        _deployments: &HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        if is_dmt_reward_address_at_height(wtx, tr.creator.as_str(), block.height)? {
+            return Ok(());
+        }
+        let form = match tr.payload {
+            TokenTradePayload::Offer {
+                ticker,
+                amount_raw,
+                amount_was_number,
+                valid_until,
+                accept,
+            } => {
+                if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+                    && (amount_was_number || accept.iter().any(|i| i.amount_was_number))
+                {
+                    return Ok(());
+                }
+                let offer_ticker = canonical_ticker(&ticker);
+                let mut acc = Vec::new();
+                for item in accept {
+                    let t = canonical_ticker(&item.ticker);
+                    acc.push(tables::PendingTradeAccept {
+                        ticker: t,
+                        amount_raw: item.amount_raw,
+                        amount_was_number: item.amount_was_number,
+                    });
+                }
+                if acc.is_empty() {
+                    return Ok(());
+                }
+                tables::PendingTradeForm::Offer {
+                    offer_ticker,
+                    offer_amount_raw: amount_raw,
+                    offer_amount_was_number: amount_was_number,
+                    valid_until,
+                    accept: acc,
+                }
+            }
+            TokenTradePayload::Cancel { trade_id } => tables::PendingTradeForm::Cancel { trade_id },
+            TokenTradePayload::Fill {
+                ticker,
+                amount_raw,
+                amount_was_number,
+                trade_id,
+                fee_receiver,
+            } => {
+                if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT && amount_was_number {
+                    return Ok(());
+                }
+                let accepted_ticker = canonical_ticker(&ticker);
+                tables::PendingTradeForm::Fill {
+                    accepted_ticker,
+                    accepted_amount_raw: amount_raw,
+                    accepted_amount_was_number: amount_was_number,
+                    trade_id,
+                    fee_receiver: fee_receiver.map(|a| a.as_str().to_string()),
+                }
+            }
+        };
+        {
+            let mut table = wtx.open_table(tables::PENDING_TRADES)?;
+            let row = tables::PendingTrade {
+                creator: tr.creator.clone(),
+                inscribed_height: block.height,
+                form: form.clone(),
+                consumed_height: None,
+            };
+            table.insert(tr.inscription_id.as_str(), encode(&row)?.as_slice())?;
+        }
+        let ticker = match &form {
+            tables::PendingTradeForm::Offer { offer_ticker, .. } => offer_ticker.as_str(),
+            tables::PendingTradeForm::Fill {
+                accepted_ticker, ..
+            } => accepted_ticker.as_str(),
+            tables::PendingTradeForm::Cancel { .. } => "dmt-nat",
+        };
+        events.push(self.new_event(
+            ticker,
+            EventFamily::Transfer,
+            EventType::TokenSendInscribeAdmitted,
+            block,
+            occurred_at,
+            Some(tr.tx_index),
+            Some(tr.inscription_id),
+            Some(tr.creator),
+            None,
+            EventDelta::default(),
+            serde_json::json!({ "op": "token-trade" }),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_auth_reveal(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        ar: PendingAuthReveal,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        _deployments: &HashMap<String, Deployment>,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        {
+            let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
+            let row = tables::PendingAuth {
+                creator: ar.creator.clone(),
+                inscribed_height: block.height,
+                form: ar.form.clone(),
+                consumed_height: None,
+            };
+            table.insert(ar.inscription_id.as_str(), encode(&row)?.as_slice())?;
+        }
+        let et = match &ar.form {
+            tables::PendingAuthForm::Create { .. } => EventType::TokenAuthCreateInscribed,
+            tables::PendingAuthForm::Cancel { .. } => EventType::TokenAuthCancelInscribed,
+        };
+        events.push(self.new_event(
+            "dmt-nat",
+            EventFamily::Auth,
+            et,
+            block,
+            occurred_at,
+            Some(ar.tx_index),
+            Some(ar.inscription_id),
+            Some(ar.creator),
+            None,
+            EventDelta::default(),
+            serde_json::json!({}),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    fn process_control_reveal(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        c: ControlInscribe,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        {
+            let mut table = wtx.open_table(PENDING_CONTROLS)?;
+            let v = StoredPendingControl {
+                ticker: c.ticker.clone(),
+                address: c.address.clone(),
+                op: match c.op {
+                    ControlOp::Block => "block".to_string(),
+                    ControlOp::Unblock => "unblock".to_string(),
+                },
+                inscribed_height: block.height,
+                consumed_height: None,
+            };
+            table.insert(c.inscription_id.as_str(), encode(&v)?.as_slice())?;
+        }
+        let et = match c.op {
+            ControlOp::Block => EventType::BlockTransferablesInscribed,
+            ControlOp::Unblock => EventType::UnblockTransferablesInscribed,
+        };
+        events.push(self.new_event(
+            &c.ticker,
+            EventFamily::Control,
+            et,
+            block,
+            occurred_at,
+            None,
+            Some(c.inscription_id),
+            Some(c.address),
+            None,
+            EventDelta::default(),
+            serde_json::json!({}),
+            block_hash,
+        ));
+        Ok(())
+    }
+
+    fn settle_privilege_auth(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        inscription_id: &str,
+        new_owner: Option<&str>,
+        block: &BlockView,
+    ) -> Result<()> {
+        let pending: Option<tables::PendingPrivilegeAuth> = {
+            let table = wtx.open_table(tables::PENDING_PRIVILEGE_AUTHS)?;
+            let out = table
+                .get(inscription_id)?
+                .and_then(|v| decode::<tables::PendingPrivilegeAuth>(v.value()).ok());
+            out
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        if pending.consumed_height.is_some() {
+            return Ok(());
+        }
+        let Some(owner) = new_owner else {
+            let mut table = wtx.open_table(tables::PENDING_PRIVILEGE_AUTHS)?;
+            let mut row = pending;
+            row.consumed_height = Some(block.height);
+            table.insert(inscription_id, encode(&row)?.as_slice())?;
+            return Ok(());
+        };
+        if pending.creator != owner {
+            let mut table = wtx.open_table(tables::PENDING_PRIVILEGE_AUTHS)?;
+            let mut row = pending;
+            row.consumed_height = Some(block.height);
+            table.insert(inscription_id, encode(&row)?.as_slice())?;
+            return Ok(());
+        }
+        let execution_result = (|| -> Result<()> {
+            match pending.form.clone() {
+                tables::PendingPrivilegeAuthForm::Cancel { cancel_id } => {
+                    let active_owner = {
+                        let table = wtx.open_table(tables::PRIVILEGE_AUTH_RECORDS)?;
+                        let out = table
+                            .get(cancel_id.as_str())?
+                            .and_then(|v| decode::<tables::PrivilegeAuthRecord>(v.value()).ok())
+                            .map(|r| r.authority_addr);
+                        out
+                    };
+                    if active_owner.as_deref() == Some(owner) {
+                        let mut table = wtx.open_table(tables::PRIVILEGE_AUTH_CANCELS)?;
+                        table.insert(cancel_id.as_str(), 1u8)?;
+                    }
+                }
+                tables::PendingPrivilegeAuthForm::Create {
+                    auth_json,
+                    sig_v,
+                    sig_r,
+                    sig_s,
+                    hash_hex,
+                    salt,
+                } => {
+                    let auth_bytes = serde_json::to_vec(&auth_json).unwrap_or_default();
+                    let msg_hash =
+                        crate::crypto::ecdsa_recover::compute_msg_hash(&auth_bytes, &salt);
+                    let Ok((compact, pubkey_hex)) =
+                        crate::crypto::ecdsa_recover::verify_ecdsa_recover(
+                            &sig_v, &sig_r, &sig_s, &hash_hex, &msg_hash,
+                        )
+                    else {
+                        return Ok(());
+                    };
+                    {
+                        let table = wtx.open_table(tables::PRIVILEGE_AUTH_SIG_REPLAY)?;
+                        if table.get(compact.as_str())?.is_some() {
+                            return Ok(());
+                        }
+                    }
+                    {
+                        let mut table = wtx.open_table(tables::PRIVILEGE_AUTH_RECORDS)?;
+                        let rec = tables::PrivilegeAuthRecord {
+                            inscription_id: inscription_id.to_string(),
+                            authority_addr: owner.to_string(),
+                            auth_json,
+                            sig_v,
+                            sig_r,
+                            sig_s,
+                            hash_hex,
+                            salt,
+                            authority_pubkey_hex: pubkey_hex,
+                            created_height: block.height,
+                        };
+                        table.insert(inscription_id, encode(&rec)?.as_slice())?;
+                    }
+                    {
+                        let mut table = wtx.open_table(tables::PRIVILEGE_AUTH_SIG_REPLAY)?;
+                        table.insert(compact.as_str(), 1u8)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        execution_result?;
+        {
+            let mut table = wtx.open_table(tables::PENDING_PRIVILEGE_AUTHS)?;
+            let mut row = pending;
+            row.consumed_height = Some(block.height);
+            table.insert(inscription_id, encode(&row)?.as_slice())?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_privilege_mint(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        authority_id: &str,
+        prv_obj: Option<&serde_json::Value>,
+        p: &str,
+        op: &str,
+        tick: &str,
+        amt_or_blk: &str,
+        dep: Option<&str>,
+        dta: Option<&str>,
+        owner: &str,
+    ) -> Result<bool> {
+        if !is_privilege_auth_active(wtx, authority_id)? {
+            return Ok(false);
+        }
+        let Some(prv_obj) = prv_obj else {
+            return Ok(false);
+        };
+        let Some(sig) = prv_obj.get("sig") else {
+            return Ok(false);
+        };
+        let sig_v = json_string_field(sig, "v").unwrap_or_default();
+        let sig_r = json_string_field(sig, "r").unwrap_or_default();
+        let sig_s = json_string_field(sig, "s").unwrap_or_default();
+        let hash_hex = prv_obj.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+        let salt = prv_obj.get("salt").and_then(|v| v.as_str()).unwrap_or("");
+        let address_for_msg = prv_obj
+            .get("address")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut msg = if let Some(dep) = dep {
+            format!("{p}-{op}-{tick}-{amt_or_blk}-{dep}-{address_for_msg}")
+        } else {
+            format!("{p}-{op}-{tick}-{amt_or_blk}-{address_for_msg}")
+        };
+        if let Some(dta) = dta {
+            msg.push('-');
+            msg.push_str(dta);
+        }
+        msg.push('-');
+        msg.push_str(salt);
+        let msg_hash = sha256_bytes(msg.as_bytes());
+        let Ok((compact, pubkey_hex)) = crate::crypto::ecdsa_recover::verify_ecdsa_recover(
+            &sig_v, &sig_r, &sig_s, hash_hex, &msg_hash,
+        ) else {
+            return Ok(false);
+        };
+        {
+            let table = wtx.open_table(tables::PRIVILEGE_AUTH_SIG_REPLAY)?;
+            if table.get(compact.as_str())?.is_some() {
+                return Ok(false);
+            }
+        }
+        let rec: Option<tables::PrivilegeAuthRecord> = {
+            let table = wtx.open_table(tables::PRIVILEGE_AUTH_RECORDS)?;
+            let out = table
+                .get(authority_id)?
+                .and_then(|v| decode::<tables::PrivilegeAuthRecord>(v.value()).ok());
+            out
+        };
+        let Some(rec) = rec else {
+            return Ok(false);
+        };
+        if rec.authority_pubkey_hex != pubkey_hex || address_for_msg != owner {
+            return Ok(false);
+        }
+        {
+            let mut table = wtx.open_table(tables::PRIVILEGE_AUTH_SIG_REPLAY)?;
+            table.insert(compact.as_str(), 1u8)?;
+        }
+        Ok(true)
+    }
+
+    fn snapshot_transfer_create_balance_from(
         &self,
         wtx: &redb::WriteTransaction,
         candidates: &[TransferInscribeCandidate],
-    ) -> Result<HashMap<(String, String), i128>> {
+    ) -> Result<HashMap<(String, String), TransferBalanceSnapshot>> {
         let table = wtx.open_table(WALLET_STATE)?;
         let mut out = HashMap::new();
         for c in candidates {
@@ -1812,8 +3468,13 @@ impl Syncer {
             let state: Option<WalletState> = table
                 .get((c.ticker.as_str(), c.address.as_str()))?
                 .and_then(|v| decode(v.value()).ok());
-            let avail = state.map(|s| s.available).unwrap_or(0);
-            out.insert(key, avail);
+            let snapshot = state
+                .map(|s| TransferBalanceSnapshot {
+                    total: s.total,
+                    transferable: s.transferable,
+                })
+                .unwrap_or_default();
+            out.insert(key, snapshot);
         }
         Ok(out)
     }
@@ -1845,37 +3506,40 @@ impl Syncer {
         Ok(out)
     }
 
-    fn save_carriers(
+    fn mark_tracker_dirty(&mut self, outpoint: OutPoint) {
+        self.tracker_dirty_keys
+            .insert(format!("{}:{}", outpoint.txid, outpoint.vout));
+    }
+
+    fn mark_tracker_move_dirty(&mut self, mv: &TrackerMove) {
+        match mv {
+            TrackerMove::Moved { from, to, .. } => {
+                self.mark_tracker_dirty(*from);
+                self.mark_tracker_dirty(*to);
+            }
+            TrackerMove::Burned { from, .. } => self.mark_tracker_dirty(*from),
+        }
+    }
+
+    fn save_dirty_carriers(
         &self,
         wtx: &redb::WriteTransaction,
         tracker: &InscriptionTracker,
-        previous_keys: &std::collections::HashSet<String>,
     ) -> Result<()> {
-        // Multimap can't "replace" a key's value-set in-place, so for
-        // every key that still has carriers we `remove_all` then
-        // re-insert the full current set. Keys present before and
-        // absent now get a plain `remove_all`. Re-insertion is cheap
-        // (typically 1–3 values per outpoint) and matches how ord-tap
-        // rewrites the full UtxoEntry on every touch.
+        if self.tracker_dirty_keys.is_empty() {
+            return Ok(());
+        }
         let mut table = wtx.open_multimap_table(INSCRIPTION_OWNERS)?;
 
-        // Group current state by outpoint-key.
-        let mut by_key: std::collections::HashMap<String, Vec<TrackedCarrier>> =
-            std::collections::HashMap::new();
-        for (op, carrier) in tracker_iter(tracker) {
-            let key = format!("{}:{}", op.txid, op.vout);
-            by_key.entry(key).or_default().push(carrier);
-        }
-        let current_keys: std::collections::HashSet<String> = by_key.keys().cloned().collect();
-
-        // Drop removed outpoints entirely.
-        for removed in previous_keys.difference(&current_keys) {
-            table.remove_all(removed.as_str())?;
-        }
-
-        // For each current key: clear, then re-insert full set.
-        for (key, carriers) in by_key {
+        // Multimap cannot replace one key's values in-place. For each
+        // changed outpoint, clear that one key and write its current
+        // carrier set. Untouched outpoints stay on disk unchanged.
+        for key in &self.tracker_dirty_keys {
             table.remove_all(key.as_str())?;
+            let Some(op) = parse_outpoint(key) else {
+                continue;
+            };
+            let carriers = tracker.get(&op);
             for carrier in carriers {
                 let v = InscriptionOwner {
                     inscription_id: carrier.inscription.inscription_id.clone(),
@@ -1886,7 +3550,10 @@ impl Syncer {
                         InscriptionKind::Mint => "dmt-mint".to_string(),
                         InscriptionKind::TokenSend => "token-send".to_string(),
                         InscriptionKind::TokenAuth => "token-auth".to_string(),
+                        InscriptionKind::TokenTrade => "token-trade".to_string(),
+                        InscriptionKind::PrivilegeAuth => "privilege-auth".to_string(),
                     },
+                    sequence_rank: carrier.inscription.sequence_rank,
                     current_outpoint: key.clone(),
                     offset_in_outpoint: carrier.offset_in_outpoint,
                     outpoint_value_sats: carrier.outpoint_value_sats,
@@ -1895,6 +3562,51 @@ impl Syncer {
             }
         }
         Ok(())
+    }
+
+    async fn resolve_effective_delegate_envelope(
+        &self,
+        env: &Envelope,
+        cache: &mut HashMap<String, Option<Envelope>>,
+    ) -> Result<Option<Envelope>> {
+        let Some(delegate_id) = env.delegate.as_deref() else {
+            return Ok(Some(env.clone()));
+        };
+        if let Some(cached) = cache.get(delegate_id) {
+            return Ok(cached.clone());
+        }
+        let Some((txid, index)) = parse_inscription_id(delegate_id) else {
+            return Ok(Some(env.clone()));
+        };
+        let tx = match self.rpc.get_raw_transaction(txid).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(
+                    delegate_id,
+                    error = %e,
+                    "delegate lookup failed; falling back to reveal payload"
+                );
+                return Ok(Some(env.clone()));
+            }
+        };
+        let delegate = crate::inscription::envelope::parse_envelopes_at_height(&tx, u64::MAX)
+            .into_iter()
+            .find(|candidate| {
+                matches!(
+                    candidate.kind,
+                    crate::inscription::envelope::EnvelopeKind::Inscription { index: i }
+                        if i == index
+                )
+            });
+        let Some(delegate) = delegate else {
+            return Ok(Some(env.clone()));
+        };
+        if delegate.delegate.is_some() {
+            cache.insert(delegate_id.to_string(), None);
+            return Ok(None);
+        }
+        cache.insert(delegate_id.to_string(), Some(delegate.clone()));
+        Ok(Some(delegate))
     }
 
     /// Apply a batch of tracker moves. Extracted from the old step-6
@@ -1912,7 +3624,7 @@ impl Syncer {
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
-        for (_, mv) in moves {
+        for (tx_index, mv) in moves {
             if let Some((insc_id, new_owner, consumed)) = describe_move(&mv, block.height) {
                 let mut table = wtx.open_table(INSCRIPTIONS)?;
                 let existing: Option<InscriptionIndex> = {
@@ -1941,6 +3653,7 @@ impl Syncer {
                             new_owner_address.as_deref(),
                             block,
                             occurred_at,
+                            tx_index,
                             block_hash,
                             events,
                         )?;
@@ -1953,6 +3666,7 @@ impl Syncer {
                             new_owner_address.as_deref(),
                             block,
                             occurred_at,
+                            tx_index,
                             block_hash,
                             events,
                         )?;
@@ -1965,6 +3679,7 @@ impl Syncer {
                             new_owner_address.as_deref(),
                             block,
                             occurred_at,
+                            tx_index,
                             block_hash,
                             events,
                         )?;
@@ -1976,22 +3691,62 @@ impl Syncer {
                             new_owner_address.as_deref(),
                             block,
                             occurred_at,
+                            tx_index,
                             block_hash,
                             events,
                         )?;
                     }
-                },
-                TrackerMove::Burned { inscription, .. } => {
-                    if matches!(inscription.kind, InscriptionKind::TokenTransfer) {
-                        self.burn_transfer(
+                    InscriptionKind::TokenTrade => {
+                        self.settle_token_trade(
                             wtx,
-                            &inscription.ticker,
                             &inscription.inscription_id,
+                            new_owner_address.as_deref(),
                             block,
                             occurred_at,
+                            tx_index,
                             block_hash,
                             events,
                         )?;
+                    }
+                    InscriptionKind::PrivilegeAuth => {
+                        self.settle_privilege_auth(
+                            wtx,
+                            &inscription.inscription_id,
+                            new_owner_address.as_deref(),
+                            block,
+                        )?;
+                    }
+                },
+                TrackerMove::Burned {
+                    inscription,
+                    reason,
+                    ..
+                } => {
+                    if matches!(inscription.kind, InscriptionKind::TokenTransfer) {
+                        if matches!(reason, BurnReason::OpReturn | BurnReason::Unaddressable) {
+                            self.settle_transfer(
+                                wtx,
+                                &inscription.ticker,
+                                &inscription.inscription_id,
+                                Some("-"),
+                                block,
+                                occurred_at,
+                                tx_index,
+                                block_hash,
+                                events,
+                            )?;
+                        } else {
+                            self.burn_transfer(
+                                wtx,
+                                &inscription.ticker,
+                                &inscription.inscription_id,
+                                block,
+                                occurred_at,
+                                tx_index,
+                                block_hash,
+                                events,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2007,86 +3762,107 @@ impl Syncer {
         new_owner: Option<&str>,
         block: &BlockView,
         occurred_at: DateTime<Utc>,
+        tx_index: u32,
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
-        // Look up validity row
-        let (sender, amount) = {
-            let mut table = wtx.open_table(VALID_TRANSFERS)?;
-            let existing = table
+        let valid = {
+            let table = wtx.open_table(VALID_TRANSFERS)?;
+            let got = table
                 .get(inscription_id)?
                 .and_then(|v| decode::<ValidTransfer>(v.value()).ok());
-            let Some(mut v) = existing else {
-                // Not a valid transfer; emit skip
-                events.push(self.new_event(
-                    ticker,
-                    EventFamily::Transfer,
-                    EventType::TokenTransferSkippedSemantic,
-                    block,
-                    occurred_at,
-                    None,
-                    Some(inscription_id.to_string()),
-                    new_owner.map(str::to_string),
-                    None,
-                    EventDelta::default(),
-                    serde_json::json!({ "reason": "no_valid_transfer_row" }),
-                    block_hash,
-                ));
-                return Ok(());
-            };
-            if v.consumed_height.is_some() {
-                events.push(self.new_event(
-                    ticker,
-                    EventFamily::Transfer,
-                    EventType::TokenTransferSkippedSemantic,
-                    block,
-                    occurred_at,
-                    None,
-                    Some(inscription_id.to_string()),
-                    new_owner.map(str::to_string),
-                    None,
-                    EventDelta::default(),
-                    serde_json::json!({ "reason": "already_consumed" }),
-                    block_hash,
-                ));
-                return Ok(());
-            }
-            v.consumed_height = Some(block.height);
-            let sender = v.sender.clone();
-            let amount = v.amount;
-            table.insert(inscription_id, encode(&v)?.as_slice())?;
-            (sender, amount)
+            got
         };
+        let Some(mut valid) = valid else {
+            events.push(self.new_event(
+                ticker,
+                EventFamily::Transfer,
+                EventType::TokenTransferSkippedSemantic,
+                block,
+                occurred_at,
+                Some(tx_index),
+                Some(inscription_id.to_string()),
+                new_owner.map(str::to_string),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "no_valid_transfer_row" }),
+                block_hash,
+            ));
+            return Ok(());
+        };
+        if valid.consumed_height.is_some() {
+            events.push(self.new_event(
+                ticker,
+                EventFamily::Transfer,
+                EventType::TokenTransferSkippedSemantic,
+                block,
+                occurred_at,
+                Some(tx_index),
+                Some(inscription_id.to_string()),
+                new_owner.map(str::to_string),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "already_consumed" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        let sender = valid.sender.clone();
+        let amount = valid.amount;
+        let a = i128::try_from(amount).unwrap_or(i128::MAX);
+
+        let shield_blocks =
+            dmt_reward_transfer_execution_blocks(wtx, ticker, &sender, block.height)?;
+        if shield_blocks && new_owner == Some(sender.as_str()) {
+            return Ok(());
+        }
+
+        valid.consumed_height = Some(block.height);
+        {
+            let mut table = wtx.open_table(VALID_TRANSFERS)?;
+            table.insert(inscription_id, encode(&valid)?.as_slice())?;
+        }
         // Remove from the sender's open-transferables index; this
         // inscription has settled.
         {
             let mut idx = wtx.open_table(TRANSFERABLES_BY_SENDER)?;
             idx.remove((ticker, sender.as_str(), inscription_id))?;
         }
-        let a = i128::try_from(amount).unwrap_or(i128::MAX);
 
         // Miner-reward transfer-execution shield (height >= 942,002):
-        // if the sender is a DMT-reward address, the tap is voided.
-        // Sender keeps the balance (no total debit), the transferable
-        // is released back to available, recipient gets nothing.
-        // Mirrors ord-tap's `tap_blocks_dmt_reward_transfer_execution`.
-        if block.height >= crate::ledger::deploy::NAT_MINER_TRANSFER_EXECUTION_SHIELD
-            && is_dmt_reward_address(wtx, &sender)?
-        {
-            apply_wallet_delta(wtx, ticker, &sender, 0, a, -a, 0, occurred_at)?;
+        // ord-tap voids only while the DMT-reward wallet is still
+        // blocked for this ticker. A permanent reward marker alone is
+        // not enough after an explicit unblock-transferables op.
+        if shield_blocks {
+            let state = wallet_state_snapshot(wtx, ticker, &sender)?;
+            let new_transferable = state.transferable.saturating_sub(a).max(0);
+            let delta_transferable = new_transferable - state.transferable;
+            let delta_available = -delta_transferable;
+            if delta_available != 0 || delta_transferable != 0 {
+                apply_wallet_delta(
+                    wtx,
+                    ticker,
+                    &sender,
+                    0,
+                    delta_available,
+                    delta_transferable,
+                    0,
+                    occurred_at,
+                )?;
+            }
             events.push(self.new_event(
                 ticker,
                 EventFamily::Transfer,
                 EventType::TokenTransferShieldVoided,
                 block,
                 occurred_at,
-                None,
+                Some(tx_index),
                 Some(inscription_id.to_string()),
                 Some(sender),
                 new_owner.map(str::to_string),
                 EventDelta {
-                    delta_available: a,
-                    delta_transferable: -a,
+                    delta_available,
+                    delta_transferable,
                     ..Default::default()
                 },
                 serde_json::json!({ "amount": amount.to_string(), "reason": "dmt_reward_execution_shield" }),
@@ -2095,20 +3871,77 @@ impl Syncer {
             return Ok(());
         }
 
-        // Debit sender transferable
-        apply_wallet_delta(wtx, ticker, &sender, -a, 0, -a, 0, occurred_at)?;
+        let state = wallet_state_snapshot(wtx, ticker, &sender)?;
+        let new_total = state.total.saturating_sub(a);
+        let new_transferable = state.transferable.saturating_sub(a);
+        if new_total < 0 || new_transferable < 0 {
+            let clamped_transferable = new_transferable.max(0);
+            let delta_transferable = clamped_transferable - state.transferable;
+            let delta_available = -delta_transferable;
+            if delta_available != 0 || delta_transferable != 0 {
+                apply_wallet_delta(
+                    wtx,
+                    ticker,
+                    &sender,
+                    0,
+                    delta_available,
+                    delta_transferable,
+                    0,
+                    occurred_at,
+                )?;
+            }
+            events.push(self.new_event(
+                ticker,
+                EventFamily::Transfer,
+                EventType::TokenTransferSkippedSemantic,
+                block,
+                occurred_at,
+                Some(tx_index),
+                Some(inscription_id.to_string()),
+                Some(sender),
+                new_owner.map(str::to_string),
+                EventDelta {
+                    delta_available,
+                    delta_transferable,
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "amount": amount.to_string(),
+                    "reason": "execution_revalidation_failed",
+                    "total": state.total.to_string(),
+                    "transferable": state.transferable.to_string(),
+                }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+
+        let receiver_is_sender = new_owner == Some(sender.as_str());
+        let sender_delta_total = if receiver_is_sender { 0 } else { -a };
+        let sender_delta_available = if receiver_is_sender { a } else { 0 };
+        apply_wallet_delta(
+            wtx,
+            ticker,
+            &sender,
+            sender_delta_total,
+            sender_delta_available,
+            -a,
+            0,
+            occurred_at,
+        )?;
         events.push(self.new_event(
             ticker,
             EventFamily::Transfer,
             EventType::TokenTransferDebit,
             block,
             occurred_at,
-            None,
+            Some(tx_index),
             Some(inscription_id.to_string()),
             Some(sender.clone()),
             new_owner.map(str::to_string),
             EventDelta {
-                delta_total: -a,
+                delta_total: sender_delta_total,
+                delta_available: sender_delta_available,
                 delta_transferable: -a,
                 ..Default::default()
             },
@@ -2116,7 +3949,7 @@ impl Syncer {
             block_hash,
         ));
         // Credit recipient
-        if let Some(owner) = new_owner {
+        if let Some(owner) = new_owner.filter(|owner| *owner != sender.as_str()) {
             apply_wallet_delta(wtx, ticker, owner, a, a, 0, 0, occurred_at)?;
             events.push(self.new_event(
                 ticker,
@@ -2124,7 +3957,7 @@ impl Syncer {
                 EventType::TokenTransferCredit,
                 block,
                 occurred_at,
-                None,
+                Some(tx_index),
                 Some(inscription_id.to_string()),
                 Some(owner.to_string()),
                 Some(sender),
@@ -2147,6 +3980,7 @@ impl Syncer {
         inscription_id: &str,
         block: &BlockView,
         occurred_at: DateTime<Utc>,
+        tx_index: u32,
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
@@ -2173,6 +4007,50 @@ impl Syncer {
             idx.remove((ticker, sender.as_str(), inscription_id))?;
         }
         let a = i128::try_from(amount).unwrap_or(i128::MAX);
+        let state = wallet_state_snapshot(wtx, ticker, &sender)?;
+        let new_total = state.total.saturating_sub(a);
+        let new_transferable = state.transferable.saturating_sub(a);
+        if new_total < 0 || new_transferable < 0 {
+            let clamped_transferable = new_transferable.max(0);
+            let delta_transferable = clamped_transferable - state.transferable;
+            let delta_available = -delta_transferable;
+            if delta_available != 0 || delta_transferable != 0 {
+                apply_wallet_delta(
+                    wtx,
+                    ticker,
+                    &sender,
+                    0,
+                    delta_available,
+                    delta_transferable,
+                    0,
+                    occurred_at,
+                )?;
+            }
+            events.push(self.new_event(
+                ticker,
+                EventFamily::Transfer,
+                EventType::TokenTransferSkippedSemantic,
+                block,
+                occurred_at,
+                Some(tx_index),
+                Some(inscription_id.to_string()),
+                Some(sender),
+                None,
+                EventDelta {
+                    delta_available,
+                    delta_transferable,
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "amount": amount.to_string(),
+                    "reason": "burn_revalidation_failed",
+                    "total": state.total.to_string(),
+                    "transferable": state.transferable.to_string(),
+                }),
+                block_hash,
+            ));
+            return Ok(());
+        }
         apply_wallet_delta(wtx, ticker, &sender, -a, 0, -a, a, occurred_at)?;
         events.push(self.new_event(
             ticker,
@@ -2180,7 +4058,7 @@ impl Syncer {
             EventType::TokenTransferBurned,
             block,
             occurred_at,
-            None,
+            Some(tx_index),
             Some(inscription_id.to_string()),
             Some(sender),
             None,
@@ -2204,6 +4082,7 @@ impl Syncer {
         new_owner: Option<&str>,
         block: &BlockView,
         occurred_at: DateTime<Utc>,
+        tx_index: u32,
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
@@ -2215,6 +4094,9 @@ impl Syncer {
         let Some(p) = pending else {
             return Ok(());
         };
+        if p.consumed_height.is_some() {
+            return Ok(());
+        }
         // Self-send check: tap only if new_owner == inscriber's address.
         let self_send = matches!(new_owner, Some(o) if o == p.address);
         if self_send {
@@ -2231,7 +4113,7 @@ impl Syncer {
                 et,
                 block,
                 occurred_at,
-                None,
+                Some(tx_index),
                 Some(inscription_id.to_string()),
                 Some(p.address.clone()),
                 None,
@@ -2240,9 +4122,10 @@ impl Syncer {
                 block_hash,
             ));
         }
-        // Consume either way
         let mut table = wtx.open_table(PENDING_CONTROLS)?;
-        table.remove(inscription_id)?;
+        let mut row = p;
+        row.consumed_height = Some(block.height);
+        table.insert(inscription_id, encode(&row)?.as_slice())?;
         Ok(())
     }
 
@@ -2260,6 +4143,7 @@ impl Syncer {
         new_owner: Option<&str>,
         block: &BlockView,
         occurred_at: DateTime<Utc>,
+        tx_index: u32,
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
@@ -2277,16 +4161,15 @@ impl Syncer {
         // Self-tap rule: creator == new_owner (ord-tap line 87).
         let self_tap = matches!(new_owner, Some(o) if o == ps.creator);
         if !self_tap {
-            // Not a self-tap — consume without emitting any item events
-            // so the pending row doesn't get re-processed on a later
-            // transfer. Parity with ord-tap, which early-returns.
+            // ord-tap deletes accumulator state on the first movement even
+            // when the output owner does not match the creator.
             ps.consumed_height = Some(block.height);
             let mut table = wtx.open_table(tables::PENDING_SENDS)?;
             table.insert(inscription_id, encode(&ps)?.as_slice())?;
             return Ok(());
         }
         // Miner-reward shield at move time too — ord-tap /tmp/ot_send.rs:90-91.
-        if is_dmt_reward_address(wtx, &ps.creator)? {
+        if is_dmt_reward_address_at_height(wtx, &ps.creator, block.height)? {
             ps.consumed_height = Some(block.height);
             let mut table = wtx.open_table(tables::PENDING_SENDS)?;
             table.insert(inscription_id, encode(&ps)?.as_slice())?;
@@ -2294,15 +4177,29 @@ impl Syncer {
         }
         use crate::ledger::send::{execute_send_item, SendItemOutcome};
         for item in &ps.items {
+            if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT && item.amount_was_number {
+                continue;
+            }
+            let Some(amount) = (if item.amount_raw.is_empty() {
+                if item.amount == 0 {
+                    None
+                } else {
+                    Some(item.amount)
+                }
+            } else {
+                parse_deployed_amount(wtx, &item.ticker, &item.amount_raw)?
+            }) else {
+                continue;
+            };
             let outcome = execute_send_item(
                 wtx,
                 &item.ticker,
                 &ps.creator,
                 &item.recipient,
-                item.amount,
+                amount,
                 occurred_at,
             )?;
-            let a = i128::try_from(item.amount).unwrap_or(i128::MAX);
+            let a = i128::try_from(amount).unwrap_or(i128::MAX);
             match outcome {
                 SendItemOutcome::Sent => {
                     events.push(self.new_event(
@@ -2311,7 +4208,7 @@ impl Syncer {
                         EventType::TokenSendDebit,
                         block,
                         occurred_at,
-                        None,
+                        Some(tx_index),
                         Some(inscription_id.to_string()),
                         Some(ps.creator.clone()),
                         Some(item.recipient.clone()),
@@ -2320,7 +4217,7 @@ impl Syncer {
                             delta_available: -a,
                             ..Default::default()
                         },
-                        serde_json::json!({ "amount": item.amount.to_string() }),
+                        serde_json::json!({ "amount": amount.to_string() }),
                         block_hash,
                     ));
                     events.push(self.new_event(
@@ -2329,7 +4226,7 @@ impl Syncer {
                         EventType::TokenSendCredit,
                         block,
                         occurred_at,
-                        None,
+                        Some(tx_index),
                         Some(inscription_id.to_string()),
                         Some(item.recipient.clone()),
                         Some(ps.creator.clone()),
@@ -2338,47 +4235,13 @@ impl Syncer {
                             delta_available: a,
                             ..Default::default()
                         },
-                        serde_json::json!({ "amount": item.amount.to_string() }),
+                        serde_json::json!({ "amount": amount.to_string() }),
                         block_hash,
                     ));
                 }
                 SendItemOutcome::SelfSend => {
-                    // Emit paired 0-delta events for audit trail; no
-                    // wallet_state movement.
-                    events.push(self.new_event(
-                        &item.ticker,
-                        EventFamily::Send,
-                        EventType::TokenSendDebit,
-                        block,
-                        occurred_at,
-                        None,
-                        Some(inscription_id.to_string()),
-                        Some(ps.creator.clone()),
-                        Some(item.recipient.clone()),
-                        EventDelta::default(),
-                        serde_json::json!({
-                            "amount": item.amount.to_string(),
-                            "self_send": true,
-                        }),
-                        block_hash,
-                    ));
-                    events.push(self.new_event(
-                        &item.ticker,
-                        EventFamily::Send,
-                        EventType::TokenSendCredit,
-                        block,
-                        occurred_at,
-                        None,
-                        Some(inscription_id.to_string()),
-                        Some(item.recipient.clone()),
-                        Some(ps.creator.clone()),
-                        EventDelta::default(),
-                        serde_json::json!({
-                            "amount": item.amount.to_string(),
-                            "self_send": true,
-                        }),
-                        block_hash,
-                    ));
+                    // ord-tap's internal send helper returns before
+                    // writing transfer logs for self-sends.
                 }
                 SendItemOutcome::Skipped => {
                     events.push(self.new_event(
@@ -2387,13 +4250,13 @@ impl Syncer {
                         EventType::TokenSendSkipped,
                         block,
                         occurred_at,
-                        None,
+                        Some(tx_index),
                         Some(inscription_id.to_string()),
                         Some(ps.creator.clone()),
                         Some(item.recipient.clone()),
                         EventDelta::default(),
                         serde_json::json!({
-                            "amount": item.amount.to_string(),
+                            "amount": amount.to_string(),
                             "reason": "insufficient_available",
                         }),
                         block_hash,
@@ -2420,6 +4283,7 @@ impl Syncer {
         new_owner: Option<&str>,
         block: &BlockView,
         occurred_at: DateTime<Utc>,
+        tx_index: u32,
         block_hash: &str,
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
@@ -2437,6 +4301,8 @@ impl Syncer {
         // Self-tap rule: acc.addr == new_owner (ord-tap auth line 129).
         let self_tap = matches!(new_owner, Some(o) if o == pa.creator);
         if !self_tap {
+            // ord-tap deletes accumulator state on the first movement even
+            // when the output owner does not match the creator.
             pa.consumed_height = Some(block.height);
             let mut table = wtx.open_table(tables::PENDING_AUTHS)?;
             table.insert(inscription_id, encode(&pa)?.as_slice())?;
@@ -2450,12 +4316,12 @@ impl Syncer {
                     t.insert(cancel_id.as_str(), 1u8)?;
                 }
                 events.push(self.new_event(
-                    "nat",
+                    "dmt-nat",
                     EventFamily::Auth,
                     EventType::TokenAuthCancelTapped,
                     block,
                     occurred_at,
-                    None,
+                    Some(tx_index),
                     Some(inscription_id.to_string()),
                     Some(pa.creator.clone()),
                     None,
@@ -2491,12 +4357,12 @@ impl Syncer {
                         };
                         if already_used {
                             events.push(self.new_event(
-                                "nat",
+                                "dmt-nat",
                                 EventFamily::Auth,
                                 EventType::TokenAuthCreateRejected,
                                 block,
                                 occurred_at,
-                                None,
+                                Some(tx_index),
                                 Some(inscription_id.to_string()),
                                 Some(pa.creator.clone()),
                                 None,
@@ -2505,6 +4371,17 @@ impl Syncer {
                                 block_hash,
                             ));
                         } else {
+                            for ticker in auth_tickers {
+                                let table = wtx.open_table(DEPLOYMENTS)?;
+                                if table.get(ticker.as_str())?.is_none() {
+                                    pa.consumed_height = Some(block.height);
+                                    let mut pending_table =
+                                        wtx.open_table(tables::PENDING_AUTHS)?;
+                                    pending_table
+                                        .insert(inscription_id, encode(&pa)?.as_slice())?;
+                                    return Ok(());
+                                }
+                            }
                             {
                                 let mut t = wtx.open_table(tables::TOKEN_AUTH_RECORDS)?;
                                 let rec = tables::TokenAuthRecord {
@@ -2521,12 +4398,12 @@ impl Syncer {
                                 t.insert(compact_sig_hex.as_str(), 1u8)?;
                             }
                             events.push(self.new_event(
-                                "nat",
+                                "dmt-nat",
                                 EventFamily::Auth,
                                 EventType::TokenAuthCreateRegistered,
                                 block,
                                 occurred_at,
-                                None,
+                                Some(tx_index),
                                 Some(inscription_id.to_string()),
                                 Some(pa.creator.clone()),
                                 None,
@@ -2541,12 +4418,12 @@ impl Syncer {
                     }
                     Err(fail) => {
                         events.push(self.new_event(
-                            "nat",
+                            "dmt-nat",
                             EventFamily::Auth,
                             EventType::TokenAuthCreateRejected,
                             block,
                             occurred_at,
-                            None,
+                            Some(tx_index),
                             Some(inscription_id.to_string()),
                             Some(pa.creator.clone()),
                             None,
@@ -2566,6 +4443,354 @@ impl Syncer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn settle_token_trade(
+        &mut self,
+        wtx: &redb::WriteTransaction,
+        inscription_id: &str,
+        new_owner: Option<&str>,
+        block: &BlockView,
+        occurred_at: DateTime<Utc>,
+        tx_index: u32,
+        block_hash: &str,
+        events: &mut Vec<LedgerEvent>,
+    ) -> Result<()> {
+        let pending: Option<tables::PendingTrade> = {
+            let table = wtx.open_table(tables::PENDING_TRADES)?;
+            let raw = table.get(inscription_id)?;
+            raw.and_then(|v| decode::<tables::PendingTrade>(v.value()).ok())
+        };
+        let Some(mut pt) = pending else {
+            return Ok(());
+        };
+        if pt.consumed_height.is_some() {
+            return Ok(());
+        }
+        let self_tap = matches!(new_owner, Some(o) if o == pt.creator);
+        if !self_tap {
+            // ord-tap deletes accumulator state on the first movement even
+            // when the output owner does not match the creator.
+            pt.consumed_height = Some(block.height);
+            let mut table = wtx.open_table(tables::PENDING_TRADES)?;
+            table.insert(inscription_id, encode(&pt)?.as_slice())?;
+            return Ok(());
+        }
+        if is_dmt_reward_address_at_height(wtx, &pt.creator, block.height)? {
+            pt.consumed_height = Some(block.height);
+            let mut table = wtx.open_table(tables::PENDING_TRADES)?;
+            table.insert(inscription_id, encode(&pt)?.as_slice())?;
+            return Ok(());
+        }
+
+        let execution_result = (|| -> Result<()> {
+            match &pt.form {
+                tables::PendingTradeForm::Cancel { trade_id } => {
+                    let lock: Option<tables::TradeLock> = {
+                        let table = wtx.open_table(tables::TRADE_LOCKS)?;
+                        let out = table
+                            .get(trade_id.as_str())?
+                            .and_then(|v| decode(v.value()).ok());
+                        out
+                    };
+                    if lock.as_ref().map(|l| l.creator.as_str()) == Some(pt.creator.as_str()) {
+                        let mut locks = wtx.open_table(tables::TRADE_LOCKS)?;
+                        locks.remove(trade_id.as_str())?;
+                        drop(locks);
+                        remove_trade_offers(wtx, trade_id)?;
+                    }
+                }
+                tables::PendingTradeForm::Offer {
+                    offer_ticker,
+                    offer_amount_raw,
+                    valid_until,
+                    accept,
+                    ..
+                } => {
+                    let Some(offer_amount) =
+                        parse_deployed_amount(wtx, offer_ticker, offer_amount_raw)?
+                    else {
+                        return Ok(());
+                    };
+                    if *valid_until < 0 || block.height as i64 > *valid_until {
+                        return Ok(());
+                    }
+                    if wallet_available(wtx, offer_ticker, &pt.creator)?
+                        < i128::try_from(offer_amount).unwrap_or(i128::MAX)
+                    {
+                        return Ok(());
+                    }
+                    {
+                        let mut locks = wtx.open_table(tables::TRADE_LOCKS)?;
+                        if locks.get(inscription_id)?.is_none() {
+                            let lock = tables::TradeLock {
+                                creator: pt.creator.clone(),
+                                offer_ticker: offer_ticker.clone(),
+                                offer_amount,
+                                valid_until: *valid_until,
+                                opened_height: block.height,
+                            };
+                            locks.insert(inscription_id, encode(&lock)?.as_slice())?;
+                        }
+                    }
+                    {
+                        let mut offers = wtx.open_table(tables::TRADE_OFFERS)?;
+                        for item in accept {
+                            let Some(accepted_amount) =
+                                parse_deployed_amount(wtx, &item.ticker, &item.amount_raw)?
+                            else {
+                                continue;
+                            };
+                            let offer = tables::TradeOffer {
+                                seller: pt.creator.clone(),
+                                offer_ticker: offer_ticker.clone(),
+                                offer_amount,
+                                accepted_ticker: item.ticker.clone(),
+                                accepted_amount,
+                                valid_until: *valid_until,
+                                opened_height: block.height,
+                            };
+                            offers.insert(
+                                (inscription_id, item.ticker.as_str()),
+                                encode(&offer)?.as_slice(),
+                            )?;
+                        }
+                    }
+                }
+                tables::PendingTradeForm::Fill {
+                    accepted_ticker,
+                    accepted_amount_raw,
+                    trade_id,
+                    fee_receiver,
+                    ..
+                } => {
+                    let Some(accepted_amount) =
+                        parse_deployed_amount(wtx, accepted_ticker, accepted_amount_raw)?
+                    else {
+                        return Ok(());
+                    };
+                    let lock: Option<tables::TradeLock> = {
+                        let table = wtx.open_table(tables::TRADE_LOCKS)?;
+                        let out = table
+                            .get(trade_id.as_str())?
+                            .and_then(|v| decode(v.value()).ok());
+                        out
+                    };
+                    if lock.is_none() {
+                        return Ok(());
+                    }
+                    let offer: Option<tables::TradeOffer> = {
+                        let table = wtx.open_table(tables::TRADE_OFFERS)?;
+                        let out = table
+                            .get((trade_id.as_str(), accepted_ticker.as_str()))?
+                            .and_then(|v| decode(v.value()).ok());
+                        out
+                    };
+                    let Some(offer) = offer else {
+                        return Ok(());
+                    };
+                    if offer.seller == pt.creator
+                        || is_dmt_reward_address_at_height(wtx, &offer.seller, block.height)?
+                    {
+                        return Ok(());
+                    }
+                    if accepted_amount != offer.accepted_amount {
+                        return Ok(());
+                    }
+                    if block.height as i64 > offer.valid_until {
+                        return Ok(());
+                    }
+                    let fee = fee_receiver
+                        .as_ref()
+                        .map(|_| trade_fee(accepted_amount))
+                        .unwrap_or(0);
+                    let offered_i = i128::try_from(offer.offer_amount).unwrap_or(i128::MAX);
+                    let accepted_i = i128::try_from(accepted_amount).unwrap_or(i128::MAX);
+                    let fee_i = i128::try_from(fee).unwrap_or(i128::MAX);
+                    if wallet_available(wtx, &offer.offer_ticker, &offer.seller)? < offered_i {
+                        return Ok(());
+                    }
+                    if wallet_available(wtx, accepted_ticker, &pt.creator)?
+                        < accepted_i.saturating_add(fee_i)
+                    {
+                        return Ok(());
+                    }
+
+                    reconcile_wallet_available(
+                        wtx,
+                        &offer.offer_ticker,
+                        &offer.seller,
+                        occurred_at,
+                    )?;
+                    reconcile_wallet_available(wtx, accepted_ticker, &pt.creator, occurred_at)?;
+                    apply_wallet_delta(
+                        wtx,
+                        &offer.offer_ticker,
+                        &offer.seller,
+                        -offered_i,
+                        -offered_i,
+                        0,
+                        0,
+                        occurred_at,
+                    )?;
+                    apply_wallet_delta(
+                        wtx,
+                        &offer.offer_ticker,
+                        &pt.creator,
+                        offered_i,
+                        offered_i,
+                        0,
+                        0,
+                        occurred_at,
+                    )?;
+                    apply_wallet_delta(
+                        wtx,
+                        accepted_ticker,
+                        &pt.creator,
+                        -(accepted_i + fee_i),
+                        -(accepted_i + fee_i),
+                        0,
+                        0,
+                        occurred_at,
+                    )?;
+                    apply_wallet_delta(
+                        wtx,
+                        accepted_ticker,
+                        &offer.seller,
+                        accepted_i,
+                        accepted_i,
+                        0,
+                        0,
+                        occurred_at,
+                    )?;
+                    if let Some(rcv) = fee_receiver {
+                        if fee_i > 0 {
+                            apply_wallet_delta(
+                                wtx,
+                                accepted_ticker,
+                                rcv,
+                                fee_i,
+                                fee_i,
+                                0,
+                                0,
+                                occurred_at,
+                            )?;
+                        }
+                    }
+
+                    events.push(self.new_event(
+                    &offer.offer_ticker,
+                    EventFamily::Send,
+                    EventType::TokenSendDebit,
+                    block,
+                    occurred_at,
+                    Some(tx_index),
+                    Some(inscription_id.to_string()),
+                    Some(offer.seller.clone()),
+                    Some(pt.creator.clone()),
+                    EventDelta {
+                        delta_total: -offered_i,
+                        delta_available: -offered_i,
+                        ..Default::default()
+                    },
+                    serde_json::json!({ "amount": offer.offer_amount.to_string(), "trade": trade_id }),
+                    block_hash,
+                ));
+                    events.push(self.new_event(
+                    &offer.offer_ticker,
+                    EventFamily::Send,
+                    EventType::TokenSendCredit,
+                    block,
+                    occurred_at,
+                    Some(tx_index),
+                    Some(inscription_id.to_string()),
+                    Some(pt.creator.clone()),
+                    Some(offer.seller.clone()),
+                    EventDelta {
+                        delta_total: offered_i,
+                        delta_available: offered_i,
+                        ..Default::default()
+                    },
+                    serde_json::json!({ "amount": offer.offer_amount.to_string(), "trade": trade_id }),
+                    block_hash,
+                ));
+                    events.push(self.new_event(
+                    accepted_ticker,
+                    EventFamily::Send,
+                    EventType::TokenSendDebit,
+                    block,
+                    occurred_at,
+                    Some(tx_index),
+                    Some(inscription_id.to_string()),
+                    Some(pt.creator.clone()),
+                    Some(offer.seller.clone()),
+                    EventDelta {
+                        delta_total: -(accepted_i + fee_i),
+                        delta_available: -(accepted_i + fee_i),
+                        ..Default::default()
+                    },
+                    serde_json::json!({ "amount": accepted_amount.to_string(), "fee": fee.to_string(), "trade": trade_id }),
+                    block_hash,
+                ));
+                    events.push(self.new_event(
+                    accepted_ticker,
+                    EventFamily::Send,
+                    EventType::TokenSendCredit,
+                    block,
+                    occurred_at,
+                    Some(tx_index),
+                    Some(inscription_id.to_string()),
+                    Some(offer.seller.clone()),
+                    Some(pt.creator.clone()),
+                    EventDelta {
+                        delta_total: accepted_i,
+                        delta_available: accepted_i,
+                        ..Default::default()
+                    },
+                    serde_json::json!({ "amount": accepted_amount.to_string(), "trade": trade_id }),
+                    block_hash,
+                ));
+                    if let Some(rcv) = fee_receiver {
+                        if fee_i > 0 {
+                            events.push(self.new_event(
+                            accepted_ticker,
+                            EventFamily::Send,
+                            EventType::TokenSendCredit,
+                            block,
+                            occurred_at,
+                            Some(tx_index),
+                            Some(inscription_id.to_string()),
+                            Some(rcv.clone()),
+                            Some(pt.creator.clone()),
+                            EventDelta {
+                                delta_total: fee_i,
+                                delta_available: fee_i,
+                                ..Default::default()
+                            },
+                            serde_json::json!({ "amount": fee.to_string(), "fee": true, "trade": trade_id }),
+                            block_hash,
+                        ));
+                        }
+                    }
+
+                    {
+                        let mut locks = wtx.open_table(tables::TRADE_LOCKS)?;
+                        locks.remove(trade_id.as_str())?;
+                    }
+                    remove_trade_offers(wtx, trade_id)?;
+                }
+            }
+            Ok(())
+        })();
+        execution_result?;
+
+        pt.consumed_height = Some(block.height);
+        {
+            let mut table = wtx.open_table(tables::PENDING_TRADES)?;
+            table.insert(inscription_id, encode(&pt)?.as_slice())?;
+        }
+        Ok(())
+    }
+
     /// Execute a `token-auth` redeem (balance-moving path) at reveal
     /// time. Mirrors ord-tap `/tmp/ot_auth.rs:42-102`.
     #[allow(clippy::too_many_arguments)]
@@ -2579,12 +4804,51 @@ impl Syncer {
         events: &mut Vec<LedgerEvent>,
     ) -> Result<()> {
         let p = &rr.payload;
+        if block.height >= TAP_VALUE_STRINGIFY_ACTIVATION_HEIGHT
+            && p.items.iter().any(|it| it.amount_was_number)
+        {
+            events.push(self.new_event(
+                "dmt-nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "numeric_amount_after_value_stringify" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
+        if p.items
+            .iter()
+            .any(|it| !is_valid_tap_address_at_height(&it.address_raw, block.height))
+        {
+            events.push(self.new_event(
+                "dmt-nat",
+                EventFamily::Auth,
+                EventType::TokenAuthRedeemRejected,
+                block,
+                occurred_at,
+                Some(rr.tx_index),
+                Some(rr.inscription_id.clone()),
+                Some(rr.inscriber_addr.clone()),
+                None,
+                EventDelta::default(),
+                serde_json::json!({ "reason": "invalid_recipient_address" }),
+                block_hash,
+            ));
+            return Ok(());
+        }
         // 1. Verify ECDSA over sha256(serde_json(redeem_subtree) || salt).
         let redeem_json = match serde_json::to_vec(&p.redeem_subtree_raw) {
             Ok(v) => v,
             Err(_) => {
                 events.push(self.new_event(
-                    "nat",
+                    "dmt-nat",
                     EventFamily::Auth,
                     EventType::TokenAuthRedeemRejected,
                     block,
@@ -2608,7 +4872,7 @@ impl Syncer {
             Ok(ok) => ok,
             Err(fail) => {
                 events.push(self.new_event(
-                    "nat",
+                    "dmt-nat",
                     EventFamily::Auth,
                     EventType::TokenAuthRedeemRejected,
                     block,
@@ -2632,7 +4896,7 @@ impl Syncer {
         };
         let Some(rec) = rec else {
             events.push(self.new_event(
-                "nat",
+                "dmt-nat",
                 EventFamily::Auth,
                 EventType::TokenAuthRedeemRejected,
                 block,
@@ -2650,7 +4914,7 @@ impl Syncer {
         // 3. Pubkey equality.
         if rec.authority_pubkey_hex.to_lowercase() != redeemer_pubkey_hex.to_lowercase() {
             events.push(self.new_event(
-                "nat",
+                "dmt-nat",
                 EventFamily::Auth,
                 EventType::TokenAuthRedeemRejected,
                 block,
@@ -2673,7 +4937,7 @@ impl Syncer {
         };
         if replayed {
             events.push(self.new_event(
-                "nat",
+                "dmt-nat",
                 EventFamily::Auth,
                 EventType::TokenAuthRedeemRejected,
                 block,
@@ -2694,9 +4958,10 @@ impl Syncer {
             && !rec.whitelisted_tickers.is_empty()
         {
             for it in &p.items {
-                if !rec.whitelisted_tickers.iter().any(|t| t == &it.ticker) {
+                let canon = canonical_ticker(&it.ticker);
+                if !rec.whitelisted_tickers.iter().any(|t| t == &canon) {
                     events.push(self.new_event(
-                        "nat",
+                        "dmt-nat",
                         EventFamily::Auth,
                         EventType::TokenAuthRedeemRejected,
                         block,
@@ -2724,7 +4989,7 @@ impl Syncer {
         };
         if cancelled {
             events.push(self.new_event(
-                "nat",
+                "dmt-nat",
                 EventFamily::Auth,
                 EventType::TokenAuthRedeemRejected,
                 block,
@@ -2743,19 +5008,16 @@ impl Syncer {
         use crate::ledger::auth::{execute_redeem_item, RedeemItemOutcome};
         for item in &p.items {
             let canon = canonical_ticker(&item.ticker);
-            // We only index NAT. Non-NAT items in a mixed-ticker redeem
-            // are silently skipped; if this turns out to matter for the
-            // audit we'll revisit.
-            if canon != "nat" {
+            let Some(amount) = parse_deployed_amount(wtx, &canon, &item.amount_raw)? else {
                 continue;
-            }
-            let a = i128::try_from(item.amount).unwrap_or(i128::MAX);
+            };
+            let a = i128::try_from(amount).unwrap_or(i128::MAX);
             let outcome = execute_redeem_item(
                 wtx,
                 &canon,
                 &rec.authority_addr,
                 &item.address,
-                item.amount,
+                amount,
                 occurred_at,
             )?;
             match outcome {
@@ -2776,7 +5038,7 @@ impl Syncer {
                             ..Default::default()
                         },
                         serde_json::json!({
-                            "amount": item.amount.to_string(),
+                            "amount": amount.to_string(),
                             "auth_id": rec.inscription_id,
                         }),
                         block_hash,
@@ -2797,50 +5059,15 @@ impl Syncer {
                             ..Default::default()
                         },
                         serde_json::json!({
-                            "amount": item.amount.to_string(),
+                            "amount": amount.to_string(),
                             "auth_id": rec.inscription_id,
                         }),
                         block_hash,
                     ));
                 }
                 RedeemItemOutcome::SelfSend => {
-                    // Paired audit events, 0 deltas.
-                    events.push(self.new_event(
-                        &canon,
-                        EventFamily::Auth,
-                        EventType::TokenAuthRedeemDebit,
-                        block,
-                        occurred_at,
-                        Some(rr.tx_index),
-                        Some(rr.inscription_id.clone()),
-                        Some(rec.authority_addr.clone()),
-                        Some(item.address.clone()),
-                        EventDelta::default(),
-                        serde_json::json!({
-                            "amount": item.amount.to_string(),
-                            "self_send": true,
-                            "auth_id": rec.inscription_id,
-                        }),
-                        block_hash,
-                    ));
-                    events.push(self.new_event(
-                        &canon,
-                        EventFamily::Auth,
-                        EventType::TokenAuthRedeemCredit,
-                        block,
-                        occurred_at,
-                        Some(rr.tx_index),
-                        Some(rr.inscription_id.clone()),
-                        Some(item.address.clone()),
-                        Some(rec.authority_addr.clone()),
-                        EventDelta::default(),
-                        serde_json::json!({
-                            "amount": item.amount.to_string(),
-                            "self_send": true,
-                            "auth_id": rec.inscription_id,
-                        }),
-                        block_hash,
-                    ));
+                    // ord-tap's internal send helper returns before
+                    // writing transfer logs for self-sends.
                 }
                 RedeemItemOutcome::Skipped => {
                     events.push(self.new_event(
@@ -2855,7 +5082,7 @@ impl Syncer {
                         Some(item.address.clone()),
                         EventDelta::default(),
                         serde_json::json!({
-                            "amount": item.amount.to_string(),
+                            "amount": amount.to_string(),
                             "reason": "insufficient_available",
                             "auth_id": rec.inscription_id,
                         }),
@@ -2925,86 +5152,99 @@ impl Syncer {
     }
 }
 
-/// Accept only TAP payloads whose ticker matches the indexed asset in
-/// the form ord-tap expects for that op.
+/// Fold a raw on-chain ticker string to its canonical TAP key.
 ///
-/// ord-tap's dmt-deploy stores the deploy under `dmt-<short>`, and
-/// dmt-mint prepends the same prefix on lookup, so both accept the
-/// short form `nat`. Every other op does a literal `d/<tick>` lookup,
-/// so it only accepts the long form `dmt-nat` (case-insensitive).
-/// Mirroring this is necessary for balance parity — see scan.rs
-/// comment at the admission site.
-fn envelope_matches_indexed(env: &TapEnvelope) -> bool {
-    let t = env.ticker().to_ascii_lowercase();
-    match env {
-        TapEnvelope::Deploy(_) | TapEnvelope::Mint(_) => t == "nat",
-        // token-send / token-auth carry multiple items, each with its own
-        // tick. We admit the envelope if ANY item references dmt-nat —
-        // unrelated-ticker items inside the same inscription are filtered
-        // at the per-item stage.
-        TapEnvelope::Send(s) => s
-            .items
-            .iter()
-            .any(|it| canonical_ticker(it.ticker.as_str()) == "nat"),
-        TapEnvelope::Auth(a) => match &a.form {
-            // Cancel form carries no ticker at all — admit. The cancel
-            // either references a NAT authority (useful) or doesn't
-            // (harmless; our scan won't find the auth record).
-            crate::protocol::auth::TokenAuthForm::Cancel(_) => true,
-            // Create form: admit if the whitelist is empty OR mentions
-            // dmt-nat. Empty is ord-tap's permissive default.
-            crate::protocol::auth::TokenAuthForm::Create(c) => {
-                c.auth_tickers.is_empty()
-                    || c.auth_tickers.iter().any(|t| canonical_ticker(t) == "nat")
+/// ord-tap stores DMT deployments under `dmt-<tick>` and plain TAP
+/// deployments under `<tick>`. Keep that namespace boundary intact so
+/// a plain `nat` token cannot shadow DMT NAT.
+fn canonical_ticker(raw: &str) -> String {
+    raw.to_ascii_lowercase()
+}
+
+fn raw_transfer_tick_matches_deployment_kind(raw: &str, deployment_is_dmt: bool) -> bool {
+    // ord-tap stores DMT deployments under dmt-<tick> and token-transfer
+    // creation looks up the raw lowercased transfer tick. A bare "nat"
+    // transfer therefore must not target the DMT NAT deployment.
+    !deployment_is_dmt || raw.to_ascii_lowercase().starts_with("dmt-")
+}
+
+fn dmt_effective_ticker(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    format!("dmt-{lower}")
+}
+
+fn ordered_reveal_key(op: &OrderedTapOp) -> TapOrderKey {
+    match op {
+        OrderedTapOp::DmtElement(k, _)
+        | OrderedTapOp::DmtDeploy(k, _)
+        | OrderedTapOp::DmtMint(k, _)
+        | OrderedTapOp::TokenDeploy(k, _)
+        | OrderedTapOp::TokenMint(k, _)
+        | OrderedTapOp::SendReveal(k, _)
+        | OrderedTapOp::TradeReveal(k, _)
+        | OrderedTapOp::AuthReveal(k, _)
+        | OrderedTapOp::PrivilegeAuthReveal(k, _)
+        | OrderedTapOp::Control(k, _) => *k,
+        OrderedTapOp::AuthRedeem(rr) => {
+            TapOrderKey::new(rr.tx_index, rr.landing_vout, rr.landing_offset, 1, rr.rank)
+        }
+        OrderedTapOp::TransferInscribe(ti) => TapOrderKey::new(
+            ti.tx_index,
+            ti.landing_vout,
+            ti.landing_offset,
+            1,
+            ti.inscription_number,
+        ),
+        OrderedTapOp::Move { tx_index, mv } => match mv {
+            TrackerMove::Moved { to, to_offset, .. } => {
+                TapOrderKey::new(*tx_index, to.vout, *to_offset, 0, 0)
             }
-            // Redeem form: admit if any item references dmt-nat.
-            crate::protocol::auth::TokenAuthForm::Redeem(r) => r
-                .items
-                .iter()
-                .any(|it| canonical_ticker(it.ticker.as_str()) == "nat"),
+            TrackerMove::Burned { .. } => TapOrderKey::new(*tx_index, u32::MAX, u64::MAX, 0, 0),
         },
-        _ => t == "dmt-nat",
     }
 }
 
-/// Fold a raw on-chain ticker string to its canonical form.
-///
-/// Per the DMT docs, `token-transfer` inscriptions carry `dmt-<name>`
-/// while `dmt-deploy` / `dmt-mint` carry `<name>`. Strip the prefix so
-/// both forms map to the same deployment ticker. Lowercased since TAP
-/// matches case-insensitively.
-fn canonical_ticker(raw: &str) -> String {
-    // Do NOT trim. ord-tap matches the raw tick string literally, so
-    // " dmt-nat" (with leading space) must NOT fold onto "nat". See
-    // protocol/ticker.rs for the canonical parser that rejects whitespace
-    // outright; this function handles callers that already hold a raw
-    // or normalized string and just need case + prefix collapsing.
-    let lower = raw.to_ascii_lowercase();
-    lower
-        .strip_prefix("dmt-")
-        .map(str::to_string)
-        .unwrap_or(lower)
-}
-
-async fn fetch_block_bits(rpc: &RpcClient, height: u64) -> Result<u32> {
-    rpc.get_block_bits(height).await
-}
-
-async fn fetch_block_bits_retry(rpc: &RpcClient, height: u64) -> Result<u32> {
+async fn fetch_block_header_fields_retry(rpc: &RpcClient, height: u64) -> Result<(u32, u32)> {
     let mut delay_ms = 200u64;
-    let mut last_err: Option<crate::error::Error> = None;
-    for _ in 0..3 {
-        match fetch_block_bits(rpc, height).await {
-            Ok(b) => return Ok(b),
+    loop {
+        match rpc.get_block_header_fields(height).await {
+            Ok(v) => return Ok(v),
             Err(e) => {
-                last_err = Some(e);
+                tracing::warn!(height, error = %e, "block header fields fetch failed; retrying");
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                delay_ms *= 2;
+                delay_ms = (delay_ms * 2).min(5_000);
             }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| crate::error::Error::Rpc(format!("bits fetch failed at {height}"))))
+}
+
+fn is_privilege_auth_active(wtx: &redb::WriteTransaction, auth_id: &str) -> Result<bool> {
+    let records = wtx.open_table(tables::PRIVILEGE_AUTH_RECORDS)?;
+    let exists = records.get(auth_id)?.is_some();
+    if !exists {
+        return Ok(false);
+    }
+    let cancels = wtx.open_table(tables::PRIVILEGE_AUTH_CANCELS)?;
+    let active = cancels.get(auth_id)?.is_none();
+    Ok(active)
+}
+
+fn json_string_field(v: &serde_json::Value, field: &str) -> Option<String> {
+    match v.get(field)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
 }
 
 fn describe_move(mv: &TrackerMove, _height: u64) -> Option<(String, Option<String>, bool)> {
@@ -3014,6 +5254,8 @@ fn describe_move(mv: &TrackerMove, _height: u64) -> Option<(String, Option<Strin
             InscriptionKind::TokenTransfer
                 | InscriptionKind::TokenSend
                 | InscriptionKind::TokenAuth
+                | InscriptionKind::TokenTrade
+                | InscriptionKind::PrivilegeAuth
         )
     };
     match mv {
@@ -3026,9 +5268,17 @@ fn describe_move(mv: &TrackerMove, _height: u64) -> Option<(String, Option<Strin
             new_owner_address.clone(),
             consumed(inscription.kind),
         )),
-        TrackerMove::Burned { inscription, .. } => Some((
+        TrackerMove::Burned {
+            inscription,
+            reason,
+            ..
+        } => Some((
             inscription.inscription_id.clone(),
-            None,
+            if matches!(reason, BurnReason::OpReturn | BurnReason::Unaddressable) {
+                Some("-".to_string())
+            } else {
+                None
+            },
             consumed(inscription.kind),
         )),
     }
@@ -3041,13 +5291,14 @@ fn parse_outpoint(s: &str) -> Option<OutPoint> {
     Some(OutPoint { txid, vout })
 }
 
-fn tracker_iter(t: &InscriptionTracker) -> Vec<(OutPoint, TrackedCarrier)> {
-    t.snapshot()
+fn parse_inscription_id(s: &str) -> Option<(bitcoin::Txid, u32)> {
+    let (txid, index) = s.split_once('i')?;
+    Some((txid.parse().ok()?, index.parse().ok()?))
 }
 
 /// Ord-style landing resolution: given a fresh envelope's optional
-/// pointer, return the `(vout, offset_in_outpoint)` where the
-/// inscription settles. Mirrors ord-tap
+/// pointer and default flotsam offset, return the `(vout,
+/// offset_in_outpoint)` where the inscription settles. Mirrors ord-tap
 /// `index/updater/inscription_updater.rs:520-632`:
 ///
 ///   let offset = payload.pointer()
@@ -3055,27 +5306,95 @@ fn tracker_iter(t: &InscriptionTracker) -> Vec<(OutPoint, TrackedCarrier)> {
 ///       .unwrap_or(default_offset /* = total_input_value before our input */);
 ///   // then walk outputs accumulating value; land where offset < end.
 ///
-/// For fresh inscriptions on input 0 of a reveal tx,
-/// `total_input_value` before input 0 is 0, so the default is sat 0 —
-/// always output 0 at offset 0. A valid pointer reroutes to the sat
-/// it addresses within the combined output range.
-fn resolve_landing(tx: &bitcoin::Transaction, pointer: Option<u64>) -> (usize, u64) {
+/// For fresh inscriptions on input 0 of a reveal tx, `default_offset` is
+/// usually 0. For post-Jubilee non-input-0 inscriptions, it is the sum of
+/// prior input values. A valid pointer reroutes to the sat it addresses
+/// within the combined output range.
+fn resolve_landing(
+    tx: &bitcoin::Transaction,
+    pointer: Option<u64>,
+    default_offset: u64,
+) -> Option<(usize, u64)> {
     let total_output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
     let target_sat = match pointer {
         Some(p) if p < total_output_value => p,
-        _ => 0,
+        _ => default_offset,
     };
     let mut cumulative: u64 = 0;
     for (vout, o) in tx.output.iter().enumerate() {
         let v = o.value.to_sat();
         let end = cumulative.saturating_add(v);
         if target_sat < end {
-            return (vout, target_sat - cumulative);
+            return Some((vout, target_sat - cumulative));
         }
         cumulative = end;
     }
-    // Total_output_value == 0 or target_sat == 0 & no outputs.
-    (0, 0)
+    None
+}
+
+fn inscription_sequence_rank(block_height: u64, within_block_rank: i64) -> u64 {
+    let rank = u64::try_from(within_block_rank).unwrap_or(0);
+    block_height.saturating_mul(1_000_000_000_000) + rank
+}
+
+fn map_fee_flotsam_to_coinbase(
+    block: &BlockView,
+    inscription: TrackedInscription,
+    from: OutPoint,
+    fee_prefix_before_tx: u64,
+    fee_offset: u64,
+) -> TrackerMove {
+    let coinbase = &block.txs[0];
+    let target_sat = block_subsidy_sats(block.height)
+        .saturating_add(fee_prefix_before_tx)
+        .saturating_add(fee_offset);
+    let mut cumulative = 0u64;
+    for (vout, output) in coinbase.tx.output.iter().enumerate() {
+        let value = output.value.to_sat();
+        let end = cumulative.saturating_add(value);
+        if target_sat < end {
+            if output.script_pubkey.is_op_return() {
+                return TrackerMove::Burned {
+                    inscription,
+                    from,
+                    reason: BurnReason::OpReturn,
+                };
+            }
+            if let Some(addr) = address_from_script(&output.script_pubkey) {
+                return TrackerMove::Moved {
+                    inscription,
+                    from,
+                    to: OutPoint {
+                        txid: coinbase.txid,
+                        vout: vout as u32,
+                    },
+                    to_offset: target_sat - cumulative,
+                    to_outpoint_value_sats: value,
+                    new_owner_address: Some(addr),
+                };
+            }
+            return TrackerMove::Burned {
+                inscription,
+                from,
+                reason: BurnReason::Unaddressable,
+            };
+        }
+        cumulative = end;
+    }
+    TrackerMove::Burned {
+        inscription,
+        from,
+        reason: BurnReason::IntoFees { fee_offset },
+    }
+}
+
+fn block_subsidy_sats(height: u64) -> u64 {
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        0
+    } else {
+        5_000_000_000u64 >> halvings
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3154,16 +5473,127 @@ fn wallet_is_blocked(wtx: &redb::WriteTransaction, ticker: &str, address: &str) 
     Ok(state.transferables_blocked)
 }
 
+fn wallet_available(wtx: &redb::WriteTransaction, ticker: &str, address: &str) -> Result<i128> {
+    let table = wtx.open_table(WALLET_STATE)?;
+    let Some(raw) = table.get((ticker, address))? else {
+        return Ok(0);
+    };
+    let state: WalletState = match decode(raw.value()) {
+        Ok(s) => s,
+        Err(_) => return Ok(0),
+    };
+    Ok(state.total.saturating_sub(state.transferable))
+}
+
+fn reconcile_wallet_available(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    address: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<i128> {
+    let mut state = wallet_state_snapshot(wtx, ticker, address)?;
+    let spendable = state.total.saturating_sub(state.transferable);
+    if state.available != spendable {
+        state.available = spendable;
+        if state.first_activity.is_none() {
+            state.first_activity = Some(occurred_at);
+        }
+        state.last_activity = Some(occurred_at);
+        let mut table = wtx.open_table(WALLET_STATE)?;
+        table.insert((ticker, address), encode(&state)?.as_slice())?;
+    }
+    Ok(spendable)
+}
+
+fn wallet_state_snapshot(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    address: &str,
+) -> Result<WalletState> {
+    let table = wtx.open_table(WALLET_STATE)?;
+    let Some(raw) = table.get((ticker, address))? else {
+        return Ok(WalletState::default());
+    };
+    Ok(decode(raw.value()).unwrap_or_default())
+}
+
+fn parse_deployed_amount(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    raw: &str,
+) -> Result<Option<u128>> {
+    let table = wtx.open_table(DEPLOYMENTS)?;
+    let Some(dep_raw) = table.get(ticker)? else {
+        return Ok(None);
+    };
+    let dep: Deployment = decode(dep_raw.value())?;
+    let Ok(amount) = parse_scaled_u128(raw, dep.decimals) else {
+        return Ok(None);
+    };
+    let cap = parse_scaled_u128(MAX_DEC_U64_STR, dep.decimals).unwrap_or(u128::MAX);
+    if amount == 0 || amount > cap {
+        return Ok(None);
+    }
+    Ok(Some(amount))
+}
+
+fn is_dmt_reward_address_at_height(
+    wtx: &redb::WriteTransaction,
+    address: &str,
+    height: u64,
+) -> Result<bool> {
+    if height < crate::ledger::deploy::NAT_MINER_TRANSFER_ACTIVATION {
+        return Ok(false);
+    }
+    is_dmt_reward_address(wtx, address)
+}
+
+fn dmt_reward_transfer_execution_blocks(
+    wtx: &redb::WriteTransaction,
+    ticker: &str,
+    address: &str,
+    height: u64,
+) -> Result<bool> {
+    if height < crate::ledger::deploy::NAT_MINER_TRANSFER_EXECUTION_SHIELD {
+        return Ok(false);
+    }
+    Ok(is_dmt_reward_address_at_height(wtx, address, height)?
+        && wallet_is_blocked(wtx, ticker, address)?)
+}
+
+fn remove_trade_offers(wtx: &redb::WriteTransaction, trade_id: &str) -> Result<()> {
+    let mut table = wtx.open_table(tables::TRADE_OFFERS)?;
+    let lo = (trade_id, "");
+    let hi = (trade_id, "\u{10ffff}");
+    let keys: Vec<String> = table
+        .range(lo..=hi)?
+        .filter_map(|r| r.ok())
+        .map(|(k, _)| {
+            let (_, accepted) = k.value();
+            accepted.to_string()
+        })
+        .collect();
+    for accepted in keys {
+        table.remove((trade_id, accepted.as_str()))?;
+    }
+    Ok(())
+}
+
+fn trade_fee(amount: u128) -> u128 {
+    amount.saturating_mul(30) / 10_000
+}
+
 /// Record a permanent marker that `address` has received a DMT coinbase
 /// reward credit. The marker is the prerequisite signal for the
 /// miner-reward-transfer-execution shield at height >= 942,002.
 /// Mirrors ord-tap's `dmtrwd/<addr>` key.
-fn dmt_reward_mark(wtx: &redb::WriteTransaction, address: &str) -> Result<()> {
+fn dmt_reward_mark(wtx: &redb::WriteTransaction, address: &str) -> Result<bool> {
     let mut table = wtx.open_table(DMT_REWARD_ADDRESSES)?;
     if table.get(address)?.is_none() {
         table.insert(address, 1u8)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn is_dmt_reward_address(wtx: &redb::WriteTransaction, address: &str) -> Result<bool> {
@@ -3221,4 +5651,66 @@ fn set_wallet_locked_flag(
     state.transferables_blocked = flag;
     table.insert(key, encode(&state)?.as_slice())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        canonical_ticker, dmt_effective_ticker, raw_transfer_tick_matches_deployment_kind,
+        resolve_landing,
+    };
+    use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxOut};
+
+    fn tx_with_outputs(values: &[u64]) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: values
+                .iter()
+                .map(|sats| TxOut {
+                    value: Amount::from_sat(*sats),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dmt_nat_keeps_ord_tap_namespace() {
+        assert_eq!(dmt_effective_ticker("nat"), "dmt-nat");
+        assert_eq!(canonical_ticker("dmt-nat"), "dmt-nat");
+        assert_eq!(canonical_ticker("nat"), "nat");
+    }
+
+    #[test]
+    fn dmt_transfer_create_requires_dmt_prefixed_raw_tick() {
+        assert!(!raw_transfer_tick_matches_deployment_kind("nat", true));
+        assert!(raw_transfer_tick_matches_deployment_kind("dmt-nat", true));
+        assert!(raw_transfer_tick_matches_deployment_kind("DMT-NAT", true));
+    }
+
+    #[test]
+    fn standard_tap_transfer_create_keeps_raw_tick_behavior() {
+        assert!(raw_transfer_tick_matches_deployment_kind("nat", false));
+        assert!(raw_transfer_tick_matches_deployment_kind("dmt-nat", false));
+    }
+
+    #[test]
+    fn fresh_inscription_lands_when_default_offset_is_inside_outputs() {
+        let tx = tx_with_outputs(&[100, 50]);
+        assert_eq!(resolve_landing(&tx, None, 125), Some((1, 25)));
+    }
+
+    #[test]
+    fn fresh_inscription_does_not_fallback_to_vout_zero_when_offset_is_fee_flotsam() {
+        let tx = tx_with_outputs(&[7_722]);
+        assert_eq!(resolve_landing(&tx, None, 41_704), None);
+    }
+
+    #[test]
+    fn valid_pointer_overrides_fee_flotsam_default_offset() {
+        let tx = tx_with_outputs(&[100, 50]);
+        assert_eq!(resolve_landing(&tx, Some(25), 41_704), Some((0, 25)));
+    }
 }

@@ -3,9 +3,11 @@
 //! Per TAP, tickers are case-insensitive. Length rules depend on
 //! inscription height:
 //!
-//! - Before block `861,576`: length ∈ {3} ∪ [5, 32]. Four-character
-//!   tickers are reserved.
-//! - At or after block `861,576`: length ∈ [1, 32].
+//! - Before block `861,576`: TAP user ticker length ∈ {3} ∪ [5, 32].
+//!   Four-character tickers are reserved.
+//! - At or after block `861,576`: TAP user ticker length ∈ [1, 32].
+//! - DMT transfer/deployment keys use a `dmt-` prefix, so their effective
+//!   stored ticker length can be up to 36.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +55,11 @@ pub fn normalize_ticker(raw: &str) -> Result<NormalizedTicker> {
         return Err(Error::Protocol("ticker empty".into()));
     }
     let char_count = raw.chars().count();
-    if char_count > 32 {
+    let lower = raw.to_ascii_lowercase();
+    let max_len = if lower.starts_with("dmt-") { 36 } else { 32 };
+    if char_count > max_len {
         return Err(Error::Protocol(format!(
-            "ticker too long ({char_count} chars, max 32)"
+            "ticker too long ({char_count} chars, max {max_len})"
         )));
     }
     if raw
@@ -66,14 +70,19 @@ pub fn normalize_ticker(raw: &str) -> Result<NormalizedTicker> {
             "ticker has whitespace / control / quote chars".into(),
         ));
     }
-    Ok(NormalizedTicker(raw.to_lowercase()))
+    Ok(NormalizedTicker(lower))
 }
 
 /// Height-conditional length rule. Returns `true` if the ticker is
 /// valid for a deploy inscribed at `inscribed_height`.
 pub fn ticker_is_valid_at_height(ticker: &NormalizedTicker, inscribed_height: u64) -> bool {
-    let len = ticker.as_str().chars().count();
-    if len == 0 || len > 32 {
+    let raw = ticker.as_str();
+    let (len, max_len) = if let Some(user_tick) = raw.strip_prefix("dmt-") {
+        (user_tick.chars().count(), 32)
+    } else {
+        (raw.chars().count(), 32)
+    };
+    if len == 0 || len > max_len {
         return false;
     }
     if inscribed_height >= TICKER_UNLOCK_HEIGHT {
@@ -124,6 +133,13 @@ mod tests {
     #[test]
     fn rejects_too_long() {
         assert!(normalize_ticker(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn accepts_dmt_prefixed_effective_ticker_length() {
+        let t = normalize_ticker(&format!("dmt-{}", "a".repeat(32))).unwrap();
+        assert!(ticker_is_valid_at_height(&t, TICKER_UNLOCK_HEIGHT));
+        assert!(normalize_ticker(&format!("dmt-{}", "a".repeat(33))).is_err());
     }
 
     // Regression: ord-tap does not trim, so " DMT-NAT" and "dmt-nat"

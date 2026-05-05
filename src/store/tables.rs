@@ -23,6 +23,9 @@ pub const DEPLOYMENTS: TableDefinition<'static, &str, &[u8]> = TableDefinition::
 /// Events: key = (ticker, event_id big-endian u64), value = JSON LedgerEvent.
 pub const EVENTS: TableDefinition<'static, (&str, u64), &[u8]> = TableDefinition::new("events");
 
+/// Global event stream: key = event_id, value = JSON LedgerEvent.
+pub const EVENTS_BY_ID: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("events_by_id");
+
 /// Wallet state: key = (ticker, address), value = JSON WalletState.
 pub const WALLET_STATE: TableDefinition<'static, (&str, &str), &[u8]> =
     TableDefinition::new("wallet_state");
@@ -68,6 +71,31 @@ pub const DMT_REWARD_ADDRESSES: TableDefinition<'static, &str, u8> =
 /// so `cumulative + amount <= max_supply` per the deploy's `max`
 /// field. Mirrors ord-tap's `dc/<tick>` "tokens_left" counter.
 pub const MINT_TOTALS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("mint_totals");
+
+/// DMT element registry. Key = lowercased element name, value =
+/// JSON `DmtElementRecord`. Mirrors ord-tap `dmt-el/<name>`.
+pub const DMT_ELEMENTS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("dmt_elements");
+
+/// DMT element inscription id -> element name. Mirrors ord-tap
+/// `dmt-<inscription_id>`.
+pub const DMT_ELEMENT_BY_INSCRIPTION: TableDefinition<'static, &str, &str> =
+    TableDefinition::new("dmt_element_by_inscription");
+
+/// DMT element uniqueness guard by `pattern + field`. Mirrors ord-tap
+/// `dmt-sig/<sig>`.
+pub const DMT_ELEMENT_SIGNATURES: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("dmt_element_signatures");
+
+/// DMT deploy inscription id -> effective ticker. Mirrors ord-tap
+/// `dmt-di/<inscription_id>`.
+pub const DMT_DEPLOY_BY_INSCRIPTION: TableDefinition<'static, &str, &str> =
+    TableDefinition::new("dmt_deploy_by_inscription");
+
+/// DMT per-token referenced block guard. Key = `(ticker, dmt_block)`.
+/// Mirrors ord-tap `dmt-blk/<tick>/<blk>`.
+pub const DMT_MINT_BLOCKS: TableDefinition<'static, (&str, u64), u8> =
+    TableDefinition::new("dmt_mint_blocks");
 
 /// Carrier map: which outpoint currently carries which inscription(s).
 /// Multimap keyed by `{txid}:{vout}`, values are JSON InscriptionOwner
@@ -132,11 +160,44 @@ pub const TOKEN_AUTH_CANCELS: TableDefinition<'static, &str, u8> =
 pub const TOKEN_AUTH_SIG_REPLAY: TableDefinition<'static, &str, u8> =
     TableDefinition::new("token_auth_sig_replay");
 
+/// Pending `privilege-auth` accumulators awaiting first-transfer
+/// settlement. Mirrors ord-tap `a/<ins_id>` for privilege-auth.
+pub const PENDING_PRIVILEGE_AUTHS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("pending_privilege_auths");
+
+/// Active privilege-auth create records. Key = authority inscription id.
+/// Mirrors ord-tap `prains/<ins_id>`.
+pub const PRIVILEGE_AUTH_RECORDS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("privilege_auth_records");
+
+/// Privilege-auth cancel markers. Key = cancelled authority inscription id.
+/// Mirrors ord-tap `prac/<ins_id>`.
+pub const PRIVILEGE_AUTH_CANCELS: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("privilege_auth_cancels");
+
+/// Privilege-auth signature replay guard. Mirrors ord-tap `prah/<sig>`.
+pub const PRIVILEGE_AUTH_SIG_REPLAY: TableDefinition<'static, &str, u8> =
+    TableDefinition::new("privilege_auth_sig_replay");
+
 /// Pending `token-auth` accumulators awaiting first-transfer settlement.
 /// Key = inscription_id, value = JSON `PendingAuth` (form-specific).
 /// Mirrors ord-tap's `a/<ins_id>` for token-auth specifically.
 pub const PENDING_AUTHS: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new("pending_auths");
+
+/// Pending `token-trade` accumulators awaiting first-transfer settlement.
+/// Key = trade inscription id, value = JSON `PendingTrade`.
+pub const PENDING_TRADES: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("pending_trades");
+
+/// Active side-0 trade locks. Key = trade inscription id, value =
+/// JSON `TradeLock`.
+pub const TRADE_LOCKS: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("trade_locks");
+
+/// Accepted ticker mapping for active trade offers. Key =
+/// `(trade_id, accepted_ticker)`, value = JSON `TradeOffer`.
+pub const TRADE_OFFERS: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("trade_offers");
 
 pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(META)?;
@@ -157,11 +218,23 @@ pub fn init_all(tx: &WriteTransaction) -> Result<()> {
     let _ = tx.open_table(TRANSFERABLES_BY_SENDER)?;
     let _ = tx.open_table(DMT_REWARD_ADDRESSES)?;
     let _ = tx.open_table(MINT_TOTALS)?;
+    let _ = tx.open_table(DMT_ELEMENTS)?;
+    let _ = tx.open_table(DMT_ELEMENT_BY_INSCRIPTION)?;
+    let _ = tx.open_table(DMT_ELEMENT_SIGNATURES)?;
+    let _ = tx.open_table(DMT_DEPLOY_BY_INSCRIPTION)?;
+    let _ = tx.open_table(DMT_MINT_BLOCKS)?;
     let _ = tx.open_table(PENDING_SENDS)?;
     let _ = tx.open_table(PENDING_AUTHS)?;
+    let _ = tx.open_table(PENDING_TRADES)?;
+    let _ = tx.open_table(TRADE_LOCKS)?;
+    let _ = tx.open_table(TRADE_OFFERS)?;
     let _ = tx.open_table(TOKEN_AUTH_RECORDS)?;
     let _ = tx.open_table(TOKEN_AUTH_CANCELS)?;
     let _ = tx.open_table(TOKEN_AUTH_SIG_REPLAY)?;
+    let _ = tx.open_table(PENDING_PRIVILEGE_AUTHS)?;
+    let _ = tx.open_table(PRIVILEGE_AUTH_RECORDS)?;
+    let _ = tx.open_table(PRIVILEGE_AUTH_CANCELS)?;
+    let _ = tx.open_table(PRIVILEGE_AUTH_SIG_REPLAY)?;
     Ok(())
 }
 
@@ -192,6 +265,19 @@ pub struct MintClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmtElementRecord {
+    pub name: String,
+    pub pattern: Option<String>,
+    pub field: u32,
+    pub inscription_id: String,
+    pub inscribed_height: u64,
+    pub txid: String,
+    pub vout: u32,
+    pub address: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidTransfer {
     pub ticker: String,
     pub sender: String,
@@ -206,6 +292,8 @@ pub struct PendingControl {
     pub address: String,
     pub op: String,
     pub inscribed_height: u64,
+    #[serde(default)]
+    pub consumed_height: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +301,11 @@ pub struct InscriptionOwner {
     pub inscription_id: String,
     pub ticker: String,
     pub kind: String,
+    /// Monotonic creation rank for ord-compatible same-sat tie
+    /// ordering. Older rows default to zero; fresh reindexes populate
+    /// the rank.
+    #[serde(default)]
+    pub sequence_rank: u64,
     pub current_outpoint: String,
     /// Sat-offset of the inscription within its current outpoint
     /// (ord-compatible FIFO tracking). Defaults to 0 for pre-upgrade
@@ -238,7 +331,12 @@ pub struct DailyStats {
 pub struct PendingSendItem {
     pub ticker: String,
     pub recipient: String,
+    #[serde(default)]
     pub amount: u128,
+    #[serde(default)]
+    pub amount_raw: String,
+    #[serde(default)]
+    pub amount_was_number: bool,
     #[serde(default)]
     pub dta: Option<String>,
 }
@@ -287,6 +385,67 @@ pub struct PendingAuth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingTradeForm {
+    Offer {
+        offer_ticker: String,
+        offer_amount_raw: String,
+        #[serde(default)]
+        offer_amount_was_number: bool,
+        valid_until: i64,
+        accept: Vec<PendingTradeAccept>,
+    },
+    Cancel {
+        trade_id: String,
+    },
+    Fill {
+        accepted_ticker: String,
+        accepted_amount_raw: String,
+        #[serde(default)]
+        accepted_amount_was_number: bool,
+        trade_id: String,
+        fee_receiver: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTradeAccept {
+    pub ticker: String,
+    pub amount_raw: String,
+    #[serde(default)]
+    pub amount_was_number: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTrade {
+    pub creator: String,
+    pub inscribed_height: u64,
+    pub form: PendingTradeForm,
+    #[serde(default)]
+    pub consumed_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeLock {
+    pub creator: String,
+    pub offer_ticker: String,
+    pub offer_amount: u128,
+    pub valid_until: i64,
+    pub opened_height: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeOffer {
+    pub seller: String,
+    pub offer_ticker: String,
+    pub offer_amount: u128,
+    pub accepted_ticker: String,
+    pub accepted_amount: u128,
+    pub valid_until: i64,
+    pub opened_height: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenAuthRecord {
     pub inscription_id: String,
     /// Source wallet for redeems. ord-tap's `link.addr`.
@@ -295,6 +454,44 @@ pub struct TokenAuthRecord {
     pub whitelisted_tickers: Vec<String>,
     /// Recovered signer pubkey (uncompressed hex, mirrors ord-tap's
     /// `pubkey_uncompressed` serialization).
+    pub authority_pubkey_hex: String,
+    pub created_height: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingPrivilegeAuthForm {
+    Create {
+        auth_json: serde_json::Value,
+        sig_v: String,
+        sig_r: String,
+        sig_s: String,
+        hash_hex: String,
+        salt: String,
+    },
+    Cancel {
+        cancel_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPrivilegeAuth {
+    pub creator: String,
+    pub inscribed_height: u64,
+    pub form: PendingPrivilegeAuthForm,
+    pub consumed_height: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivilegeAuthRecord {
+    pub inscription_id: String,
+    pub authority_addr: String,
+    pub auth_json: serde_json::Value,
+    pub sig_v: String,
+    pub sig_r: String,
+    pub sig_s: String,
+    pub hash_hex: String,
+    pub salt: String,
     pub authority_pubkey_hex: String,
     pub created_height: u64,
 }
@@ -325,6 +522,22 @@ pub fn cursor_set(tx: &WriteTransaction, cursor: &Cursor) -> Result<()> {
     let mut table = tx.open_table(META)?;
     let v = crate::store::codec::encode(cursor)?;
     table.insert("cursor_protocol_scan", v.as_slice())?;
+    Ok(())
+}
+
+pub fn next_event_id_get(tx: &redb::ReadTransaction) -> Result<Option<u64>> {
+    let table = tx.open_table(META)?;
+    let v = table.get("next_event_id")?;
+    match v {
+        Some(raw) => Ok(Some(crate::store::codec::decode(raw.value())?)),
+        None => Ok(None),
+    }
+}
+
+pub fn next_event_id_set(tx: &WriteTransaction, next_event_id: u64) -> Result<()> {
+    let mut table = tx.open_table(META)?;
+    let v = crate::store::codec::encode(&next_event_id)?;
+    table.insert("next_event_id", v.as_slice())?;
     Ok(())
 }
 

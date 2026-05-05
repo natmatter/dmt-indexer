@@ -23,10 +23,9 @@ timeout_secs = 60
 db_path = "/var/lib/dmt-indexer/index.redb"
 
 [sync]
-# NAT deploy block. Earlier heights have no DMT activity we care about,
-# so start_height governs the cold-start floor. For existing DBs this
-# value is ignored in favor of the persisted cursor.
-start_height        = 817709
+# Full TAP history floor. For existing DBs this value is ignored in
+# favor of the persisted cursor.
+start_height        = 779832
 # Blocks behind tip to keep indexed. 0 = index up to the tip. Any reorg
 # triggers a rewind + replay on the next tick.
 finality_depth      = 0

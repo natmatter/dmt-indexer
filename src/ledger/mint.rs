@@ -107,10 +107,8 @@ pub fn resolve_mints(
         }
         // `blk` range sanity. Ord-tap only rejects negative or
         // future-dated `blk` (see `/tmp/ot_dmt_mint.rs:102-104`); a
-        // value of `0` is admitted and simply points at the genesis
-        // block's bits, which is 0 and gets silently dropped as a
-        // scarcity-zero mint downstream. We mirror that — no special
-        // rejection of `blk=0`.
+        // value of `0` is admitted and points at the genesis block's
+        // header fields. We mirror that: no special rejection of `blk=0`.
         if c.payload.block_number > block_height {
             rejected.push(RejectedMint {
                 candidate: c,

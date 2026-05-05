@@ -38,6 +38,9 @@ pub fn parse_deploy(payload: &[u8]) -> Result<DeployPayload> {
     }
     let tick = take_string(&mut body, "tick")?;
     let ticker = normalize_ticker(&tick)?;
+    if ticker.as_str().starts_with('-') || ticker.as_str().starts_with("dmt-") {
+        return Err(Error::Protocol("dmt-deploy ticker reserved".into()));
+    }
     let elem = take_string(&mut body, "elem")?;
 
     let dt = take_optional_string(&mut body, "dt")?;

@@ -8,11 +8,15 @@ pub const PROTOCOL_TAP: &str = "tap";
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum TapOp {
+    TokenDeploy,
+    TokenMint,
     DmtDeploy,
     DmtMint,
     TokenTransfer,
     TokenSend,
+    TokenTrade,
     TokenAuth,
+    PrivilegeAuth,
     BlockTransferables,
     UnblockTransferables,
 }
@@ -20,11 +24,15 @@ pub enum TapOp {
 impl TapOp {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "token-deploy" => Some(Self::TokenDeploy),
+            "token-mint" => Some(Self::TokenMint),
             "dmt-deploy" => Some(Self::DmtDeploy),
             "dmt-mint" => Some(Self::DmtMint),
             "token-transfer" => Some(Self::TokenTransfer),
             "token-send" => Some(Self::TokenSend),
+            "token-trade" => Some(Self::TokenTrade),
             "token-auth" => Some(Self::TokenAuth),
+            "privilege-auth" => Some(Self::PrivilegeAuth),
             "block-transferables" => Some(Self::BlockTransferables),
             "unblock-transferables" => Some(Self::UnblockTransferables),
             _ => None,
@@ -33,11 +41,15 @@ impl TapOp {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::TokenDeploy => "token-deploy",
+            Self::TokenMint => "token-mint",
             Self::DmtDeploy => "dmt-deploy",
             Self::DmtMint => "dmt-mint",
             Self::TokenTransfer => "token-transfer",
             Self::TokenSend => "token-send",
+            Self::TokenTrade => "token-trade",
             Self::TokenAuth => "token-auth",
+            Self::PrivilegeAuth => "privilege-auth",
             Self::BlockTransferables => "block-transferables",
             Self::UnblockTransferables => "unblock-transferables",
         }
@@ -65,6 +77,118 @@ pub fn decode_envelope(payload: &[u8]) -> Result<(TapOp, Map<String, Value>)> {
     let op = TapOp::parse(&op_str)
         .ok_or_else(|| Error::Protocol(format!("unsupported op: {op_str}")))?;
     Ok((op, object))
+}
+
+/// Match ord-tap's ValueStringifyActivation parser: raw JSON numbers
+/// assigned to `amt`, `lim`, or `max` are parsed as strings while all
+/// other JSON values keep normal serde semantics.
+pub fn value_stringify_source(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let key_start = i;
+        i += 1;
+        let mut escaped = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        let key_end = i;
+        out.push_str(&s[key_start..key_end]);
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            i = key_end;
+            continue;
+        }
+        let key = serde_json::from_str::<String>(&s[key_start..key_end]).unwrap_or_default();
+        if key != "max" && key != "lim" && key != "amt" {
+            out.push_str(&s[i..=j]);
+            i = j + 1;
+            continue;
+        }
+        out.push_str(&s[i..=j]);
+        j += 1;
+        let value_prefix_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        out.push_str(&s[value_prefix_start..j]);
+        if j >= bytes.len() {
+            i = j;
+            continue;
+        }
+        if let Some(num_end) = scan_json_number_end(bytes, j) {
+            out.push('"');
+            out.push_str(&s[j..num_end]);
+            out.push('"');
+            i = num_end;
+        } else {
+            i = j;
+        }
+    }
+    out
+}
+
+fn scan_json_number_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    if bytes[i] == b'0' {
+        i += 1;
+    } else if (b'1'..=b'9').contains(&bytes[i]) {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        return None;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        let frac_start = i + 1;
+        i = frac_start;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == frac_start {
+            return Some(frac_start - 1);
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let exp_marker = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return Some(exp_marker);
+        }
+    }
+    Some(i)
 }
 
 pub fn take_string(object: &mut Map<String, Value>, field: &'static str) -> Result<String> {
@@ -119,7 +243,13 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        assert!(decode_envelope(br#"{"p":"tap","op":"token-trade"}"#).is_err());
+        assert!(decode_envelope(br#"{"p":"tap","op":"token-unknown"}"#).is_err());
+    }
+
+    #[test]
+    fn accepts_token_trade() {
+        let (op, _) = decode_envelope(br#"{"p":"tap","op":"token-trade"}"#).unwrap();
+        assert_eq!(op, TapOp::TokenTrade);
     }
 
     #[test]
@@ -132,5 +262,26 @@ mod tests {
     fn accepts_token_auth() {
         let (op, _) = decode_envelope(br#"{"p":"tap","op":"token-auth"}"#).unwrap();
         assert_eq!(op, TapOp::TokenAuth);
+    }
+
+    #[test]
+    fn value_stringify_preserves_writer_sources_for_amount_fields() {
+        let src = r#"{"amt":1,"items":[{"amt":74.0100},{"lim":2.500}],"nested":{"max":21000000.0100},"lim":1000.90,"max":21000000.0100,"other":42,"\u0061mt":0.0100}"#;
+        let parsed: Value = serde_json::from_str(&value_stringify_source(src)).unwrap();
+        assert_eq!(parsed.get("amt").and_then(Value::as_str), Some("0.0100"));
+        assert_eq!(parsed.get("lim").and_then(Value::as_str), Some("1000.90"));
+        assert_eq!(
+            parsed.get("max").and_then(Value::as_str),
+            Some("21000000.0100")
+        );
+        assert_eq!(parsed.get("other").and_then(Value::as_i64), Some(42));
+        assert_eq!(
+            parsed
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|items| items[0].get("amt"))
+                .and_then(Value::as_str),
+            Some("74.0100")
+        );
     }
 }

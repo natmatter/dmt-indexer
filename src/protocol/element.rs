@@ -60,6 +60,84 @@ pub fn parse_element_body(body: &str) -> Result<ElementField> {
     ElementField::from_token(segments[segments.len() - 2])
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DmtElementPayload {
+    pub name: String,
+    pub pattern: Option<String>,
+    pub field: ElementField,
+    pub field_token: String,
+}
+
+/// Parse a raw DMT element inscription (`name.field.element` or
+/// `name.pattern.field.element`). ord-tap indexes these as plain text
+/// inscriptions, not TAP JSON envelopes.
+pub fn parse_dmt_element(body: &str) -> Result<Option<DmtElementPayload>> {
+    let trimmed = body.trim();
+    let lower = trimmed.to_lowercase();
+    if !lower.ends_with(".element") {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() < 3 {
+        return Ok(None);
+    }
+    let element_tag = parts[parts.len() - 1];
+    if element_tag != "element" {
+        return Ok(None);
+    }
+    let name = parts[0].to_lowercase();
+    if name.is_empty()
+        || name.chars().any(|c| {
+            matches!(
+                c,
+                '/' | '.'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ':'
+                    | ';'
+                    | '"'
+                    | '\''
+                    | ' '
+                    | '\t'
+                    | '\n'
+                    | '\r'
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let field_token = parts[parts.len() - 2].to_string();
+    let parsed_field = field_token
+        .parse::<i64>()
+        .map_err(|_| Error::Protocol(format!("invalid element field: {field_token}")))?;
+    if parsed_field < 0 {
+        return Ok(None);
+    }
+    let field = ElementField::from_token(&parsed_field.to_string())?;
+    let pattern = if parts.len() > 3 {
+        let p = parts[1..parts.len() - 2].join(".");
+        if p.is_empty() {
+            None
+        } else {
+            // Rust regex is close enough for the RE2 acceptance check
+            // ord-tap performs here, and the same engine is used later
+            // for counting pattern matches.
+            regex::Regex::new(&p).map_err(|e| Error::Protocol(format!("invalid pattern: {e}")))?;
+            Some(p)
+        }
+    } else {
+        None
+    };
+    Ok(Some(DmtElementPayload {
+        name,
+        pattern,
+        field,
+        field_token,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,6 +13,9 @@ pub struct MintPayload {
     pub ticker: NormalizedTicker,
     pub deployment_inscription_id: Option<String>,
     pub block_number: u64,
+    pub block_raw: String,
+    pub dta: Option<String>,
+    pub prv: Option<serde_json::Value>,
 }
 
 pub fn parse_mint(payload: &[u8]) -> Result<MintPayload> {
@@ -26,12 +29,17 @@ pub fn parse_mint(payload: &[u8]) -> Result<MintPayload> {
     let tick = take_string(&mut body, "tick")?;
     let ticker = normalize_ticker(&tick)?;
     let dep = take_optional_string(&mut body, "dep")?;
+    let dta = take_optional_string(&mut body, "dta")?;
+    let prv = body.remove("prv");
     let blk = take_numeric_string(&mut body, "blk")?;
     let block_number = parse_block_number(&blk)?;
     Ok(MintPayload {
         ticker,
         deployment_inscription_id: dep,
         block_number,
+        block_raw: blk,
+        dta,
+        prv,
     })
 }
 
@@ -41,9 +49,19 @@ pub fn parse_mint(payload: &[u8]) -> Result<MintPayload> {
 /// apply to NAT — all NAT mints are pre-activation — so we don't
 /// re-emit the original string representation at this layer.
 fn parse_block_number(raw: &str) -> Result<u64> {
-    // ord-tap is NOT whitespace-tolerant here — mirror that.
-    let digit_prefix: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digit_prefix.is_empty() {
+    let mut chars = raw.chars().peekable();
+    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+        chars.next();
+    }
+    let mut negative = false;
+    if matches!(chars.peek(), Some('-')) {
+        negative = true;
+        chars.next();
+    } else if matches!(chars.peek(), Some('+')) {
+        chars.next();
+    }
+    let digit_prefix: String = chars.take_while(|c| c.is_ascii_digit()).collect();
+    if negative || digit_prefix.is_empty() {
         return Err(Error::Protocol(format!("blk not integer: {raw:?}")));
     }
     digit_prefix

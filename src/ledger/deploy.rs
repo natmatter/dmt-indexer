@@ -21,11 +21,19 @@ use crate::protocol::ticker::{ticker_is_valid_at_height, NormalizedTicker};
 pub struct Deployment {
     pub ticker: NormalizedTicker,
     pub deploy_inscription_id: String,
+    #[serde(default)]
+    pub dmt: bool,
     pub element_inscription_id: String,
     pub element_field: ElementField,
     pub dt: Option<String>,
     pub dim: Option<String>,
     pub bits_mode: BitsMode,
+    #[serde(default)]
+    pub decimals: u32,
+    #[serde(default)]
+    pub mint_limit: u128,
+    #[serde(default)]
+    pub privilege_auth: Option<String>,
     /// Block at which the deploy inscription was mined.
     pub activation_height: u64,
     /// Block at which coinbase-reward distribution starts (NAT: 885,588).
@@ -101,11 +109,15 @@ pub fn register(
     Ok(Deployment {
         ticker: payload.ticker,
         deploy_inscription_id,
+        dmt: true,
         element_inscription_id: payload.element_inscription_id,
         element_field,
         dt: payload.dt,
         dim: payload.dim,
         bits_mode,
+        decimals: 0,
+        mint_limit: 0,
+        privilege_auth: payload.prv,
         activation_height: inscribed_height,
         coinbase_activation,
         miner_transfer_activation,

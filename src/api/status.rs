@@ -14,7 +14,8 @@ use crate::api::state::AppState;
 use crate::ledger::deploy::Deployment;
 use crate::store::codec::decode;
 use crate::store::tables::{
-    cursor_get, Cursor, DailyStats, WalletState, DAILY_STATS, DEPLOYMENTS, WALLET_STATE,
+    cursor_get, Cursor, DailyStats, WalletState, BALANCES_BY_VALUE, DAILY_STATS, DEPLOYMENTS,
+    MINT_TOTALS, WALLET_STATE,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -215,8 +216,37 @@ async fn metrics_handler(State(s): State<Arc<AppState>>) -> impl IntoResponse {
 
 fn supply_for(s: &AppState, ticker: &str) -> crate::error::Result<(u128, u64)> {
     let rtx = s.store.read()?;
+    let total = if let Ok(table) = rtx.open_table(MINT_TOTALS) {
+        match table.get(ticker)? {
+            Some(raw) if raw.value().len() == 16 => {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(raw.value());
+                u128::from_le_bytes(bytes)
+            }
+            _ => 0,
+        }
+    } else {
+        0
+    };
+
+    if let Ok(index) = rtx.open_table(BALANCES_BY_VALUE) {
+        let lo = [0u8; 16];
+        let hi = [0xffu8; 16];
+        let mut indexed_total = 0u128;
+        let mut holders = 0u64;
+        for row in
+            index.range((ticker, lo.as_slice(), "")..=(ticker, hi.as_slice(), "\u{10ffff}"))?
+        {
+            let (_, balance) = row?;
+            indexed_total = indexed_total.saturating_add(u128::from(balance.value()));
+            holders += 1;
+        }
+        let total = if total == 0 { indexed_total } else { total };
+        return Ok((total, holders));
+    }
+
     let table = rtx.open_table(WALLET_STATE)?;
-    let mut total: u128 = 0;
+    let mut fallback_total: u128 = 0;
     let mut holders: u64 = 0;
     for row in table.iter()? {
         let (k, v) = row?;
@@ -224,13 +254,15 @@ fn supply_for(s: &AppState, ticker: &str) -> crate::error::Result<(u128, u64)> {
         if t != ticker {
             continue;
         }
-        if let Ok(st) = decode::<WalletState>(v.value()) {
-            if st.total > 0 {
-                total = total.saturating_add(st.total as u128);
-                holders += 1;
-            }
+        let Ok(st) = decode::<WalletState>(v.value()) else {
+            continue;
+        };
+        if st.total > 0 {
+            fallback_total = fallback_total.saturating_add(st.total as u128);
+            holders += 1;
         }
     }
+    let total = if total == 0 { fallback_total } else { total };
     Ok((total, holders))
 }
 

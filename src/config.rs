@@ -165,7 +165,7 @@ fn default_timeout_secs() -> u64 {
     60
 }
 fn default_start_height() -> u64 {
-    817_709
+    779_832
 }
 fn default_finality_depth() -> u64 {
     6
@@ -252,7 +252,7 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.sync.start_height, 817_709);
+        assert_eq!(cfg.sync.start_height, 779_832);
         assert_eq!(cfg.sync.finality_depth, 6);
         assert_eq!(cfg.api.bind_addr.port(), 8080);
     }

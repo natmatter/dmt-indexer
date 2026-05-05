@@ -54,7 +54,11 @@ pub struct TokenAuthCancel {
 pub struct TokenAuthRedeemItem {
     pub ticker: String,
     pub address: String,
+    pub address_raw: String,
     pub amount: u128,
+    pub amount_raw: String,
+    #[serde(default)]
+    pub amount_was_number: bool,
     pub dta: Option<String>,
 }
 
@@ -275,6 +279,7 @@ fn parse_redeem_item(v: &Value) -> Result<TokenAuthRedeemItem> {
         .ok_or_else(|| Error::Protocol("redeem item.address missing".into()))?;
     let norm_addr = normalize_address(addr_str)
         .ok_or_else(|| Error::Protocol("redeem item.address invalid".into()))?;
+    let amount_was_number = matches!(obj.get("amt"), Some(Value::Number(_)));
     let amt_str = match obj.get("amt") {
         None => return Err(Error::Protocol("redeem item.amt missing".into())),
         Some(Value::String(s)) => s.clone(),
@@ -295,7 +300,10 @@ fn parse_redeem_item(v: &Value) -> Result<TokenAuthRedeemItem> {
     Ok(TokenAuthRedeemItem {
         ticker: tick_str.to_ascii_lowercase(),
         address: norm_addr.into_inner(),
+        address_raw: addr_str.to_string(),
         amount,
+        amount_raw: amt_str,
+        amount_was_number,
         dta,
     })
 }

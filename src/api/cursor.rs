@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::state::AppState;
 use crate::ledger::event::LedgerEvent;
 use crate::store::codec::decode;
-use crate::store::tables::{Cursor, EVENTS, META};
+use crate::store::tables::{cursor_get, EVENTS, EVENTS_BY_ID};
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/cursor", get(cursor_handler))
@@ -64,50 +64,67 @@ async fn cursor_handler(State(s): State<Arc<AppState>>, Query(q): Query<CursorQu
         Err(e) => return Json(serde_json::json!({ "error": e.to_string() })).into_response(),
     };
 
-    // Tip = the persisted Cursor in META.
-    let (tip_height, tip_hash) = match rtx.open_table(META) {
-        Ok(t) => t
-            .get("cursor")
-            .ok()
-            .flatten()
-            .and_then(|raw| decode::<Cursor>(raw.value()).ok())
-            .map(|c| (c.height, c.block_hash))
-            .unwrap_or((0, String::new())),
-        Err(_) => (0, String::new()),
-    };
+    // Tip = the persisted protocol scan cursor.
+    let (tip_height, tip_hash) = cursor_get(&rtx)
+        .ok()
+        .flatten()
+        .map(|c| (c.height, c.block_hash))
+        .unwrap_or((0, String::new()));
 
-    // Scan EVENTS newest-first. Redb iterator returns entries in key
+    // Scan EVENTS_BY_ID newest-first. Redb iterator returns entries in key
     // order; `.rev()` gives us descending. We collect the last N
     // distinct (height, hash) pairs.
-    let events = match rtx.open_table(EVENTS) {
-        Ok(t) => t,
-        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })).into_response(),
-    };
-
     let mut max_event_id: u64 = 0;
     let mut recent_blocks: Vec<RecentBlock> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
 
-    if let Ok(iter) = events.iter() {
-        for row in iter.rev() {
-            let Ok((k, v)) = row else { continue };
-            let (_ticker, event_id) = k.value();
-            if max_event_id == 0 {
-                max_event_id = event_id;
+    if let Ok(events) = rtx.open_table(EVENTS_BY_ID) {
+        if let Ok(iter) = events.iter() {
+            for row in iter.rev() {
+                let Ok((k, v)) = row else { continue };
+                let event_id = k.value();
+                if max_event_id == 0 {
+                    max_event_id = event_id;
+                }
+                if recent_blocks.len() >= want_recent {
+                    // Still continue to compute max_event_id on the first
+                    // row only — which we already did.
+                    break;
+                }
+                let Ok(ev) = decode::<LedgerEvent>(v.value()) else {
+                    continue;
+                };
+                if seen.insert(ev.block_height) {
+                    recent_blocks.push(RecentBlock {
+                        height: ev.block_height,
+                        hash: ev.block_hash,
+                    });
+                }
             }
-            if recent_blocks.len() >= want_recent {
-                // Still continue to compute max_event_id on the first
-                // row only — which we already did.
-                break;
-            }
-            let Ok(ev) = decode::<LedgerEvent>(v.value()) else {
-                continue;
-            };
-            if seen.insert(ev.block_height) {
-                recent_blocks.push(RecentBlock {
-                    height: ev.block_height,
-                    hash: ev.block_hash,
-                });
+        }
+    } else if let Ok(events) = rtx.open_table(EVENTS) {
+        // Compatibility while the global stream table is warming.
+        if let Ok(iter) = events.iter() {
+            for row in iter.rev() {
+                let Ok((k, v)) = row else { continue };
+                let (_ticker, event_id) = k.value();
+                if max_event_id == 0 {
+                    max_event_id = event_id;
+                }
+                if recent_blocks.len() >= want_recent {
+                    // Still continue to compute max_event_id on the first
+                    // row only — which we already did.
+                    break;
+                }
+                let Ok(ev) = decode::<LedgerEvent>(v.value()) else {
+                    continue;
+                };
+                if seen.insert(ev.block_height) {
+                    recent_blocks.push(RecentBlock {
+                        height: ev.block_height,
+                        hash: ev.block_hash,
+                    });
+                }
             }
         }
     }
