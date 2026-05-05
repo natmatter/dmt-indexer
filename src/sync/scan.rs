@@ -1117,7 +1117,10 @@ impl Syncer {
                                     continue;
                                 }
                                 if sp.items.iter().any(|it| {
-                                    !is_valid_tap_address_at_height(it.recipient.as_str(), block.height)
+                                    !is_valid_tap_address_at_height(
+                                        it.recipient.as_str(),
+                                        block.height,
+                                    )
                                 }) {
                                     continue;
                                 }
@@ -5659,7 +5662,9 @@ mod tests {
         canonical_ticker, dmt_effective_ticker, raw_transfer_tick_matches_deployment_kind,
         resolve_landing,
     };
-    use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxOut};
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxOut,
+    };
 
     fn tx_with_outputs(values: &[u64]) -> Transaction {
         Transaction {

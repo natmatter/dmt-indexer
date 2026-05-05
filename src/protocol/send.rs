@@ -172,18 +172,14 @@ mod tests {
             item.recipient_raw,
             " bc1qx6mz7amgarnljyaqx0qequ77mrq30s23rc0ace"
         );
-        assert!(
-            crate::protocol::address::is_valid_tap_address_at_height(
-                item.recipient.as_str(),
-                828_413
-            )
-        );
-        assert!(
-            !crate::protocol::address::is_valid_tap_address_at_height(
-                item.recipient_raw.as_str(),
-                828_413
-            )
-        );
+        assert!(crate::protocol::address::is_valid_tap_address_at_height(
+            item.recipient.as_str(),
+            828_413
+        ));
+        assert!(!crate::protocol::address::is_valid_tap_address_at_height(
+            item.recipient_raw.as_str(),
+            828_413
+        ));
     }
 
     #[test]
